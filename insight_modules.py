@@ -1,0 +1,201 @@
+import pandas as pd
+import numpy as np
+import json
+import os
+from datetime import datetime
+
+def compute_feature_importance(models, features, product, timestamp):
+    importance_dict = {'product': product, 'top_features': []}
+    for model_name, model in models.items():
+        if model_name == 'Prophet' or model is None:
+            continue
+        try:
+            if hasattr(model, 'feature_importances_'):
+                importance = model.feature_importances_
+            elif hasattr(model, 'get_feature_importance'):
+                importance = model.get_feature_importance()
+            else:
+                continue
+            feature_importance = sorted(
+                zip(features, importance),
+                key=lambda x: x[1],
+                reverse=True
+            )[:5]
+            importance_dict['top_features'].extend([
+                {'Feature': feat, 'Importance': float(imp), 'Model': model_name}
+                for feat, imp in feature_importance
+            ])
+        except Exception as e:
+            print(f"[v1.20.136] Error computing feature importance for {model_name} on {product}: {e}")
+    if not importance_dict['top_features']:
+        importance_dict['top_features'] = [{'Feature': 'N/A', 'Importance': 0.0, 'Model': 'N/A'}]
+    return importance_dict
+
+def clean_data_for_json(data):
+    #print(f"[v1.20.136] Cleaning data for JSON serialization, type: {type(data)}")
+    if isinstance(data, list):
+        return [clean_data_for_json(item) for item in data]
+    elif isinstance(data, dict):
+        return {key: clean_data_for_json(value) for key, value in data.items()}
+    elif isinstance(data, (np.floating, float)):
+        return float(data) if not np.isnan(data) else None
+    elif isinstance(data, (np.integer, int)):
+        return int(data)
+    elif isinstance(data, pd.Timestamp):
+        return data.strftime('%Y-%m-%d')
+    elif pd.isna(data):
+        return None
+    return data
+
+def get_default_result(product, period):
+    return {
+        'Product': product,
+        'Model': 'N/A',
+        'Period': period,
+        'Avg_Quantity_Pred': 0.0,
+        'RMSE': None,
+        'R2': None,
+        'MAE': None,
+        'MAPE': None,
+        'Avg_Quantity_Real': 0.0
+    }
+
+def load_holidays():
+    try:
+        holidays = pd.read_csv('holidays.csv')
+        holidays['ds'] = pd.to_datetime(holidays['ds'], errors='coerce')
+        holidays = holidays.dropna(subset=['ds'])
+        print(f"[v1.20.136] Loading holidays from holidays.csv")
+        return holidays
+    except Exception as e:
+        print(f"[v1.20.136] Error loading holidays: {e}")
+        return pd.DataFrame(columns=['ds', 'holiday'])
+
+def generate_alerts(high_mape_products, sparse_products):
+    alerts = []
+    if high_mape_products:
+        alerts.append(f"High MAPE detected for products: {', '.join(high_mape_products)}. Consider reviewing data quality or model parameters.")
+    if sparse_products:
+        alerts.append(f"Sparse data detected for products: {', '.join(sparse_products)}. Consider extending the data collection period or adjusting holdout_days.")
+    if not alerts:
+        alerts.append("No significant issues detected in the forecasting process.")
+    return alerts
+
+def generate_business_strategies(results, products):
+    strategies = []
+    results_df = pd.DataFrame(results)
+    for product in products:
+        product_results = results_df[(results_df['Product'] == product) & (results_df['Period'] == 'Holdout')]
+        if product_results.empty:
+            print(f"[v1.20.136] No holdout results for product {product}, skipping strategy generation")
+            strategies.append({
+                'Product': product,
+                'Strategy': f"No sufficient data for {product}. Consider collecting more data or reviewing holdout period."
+            })
+            continue
+        mape_values = product_results['MAPE']
+        if mape_values.isna().all() or product_results.empty:
+            print(f"[v1.20.136] All MAPE values are NaN for product {product}, using default strategy")
+            strategies.append({
+                'Product': product,
+                'Strategy': f"Insufficient holdout data for {product}. Defaulting to Prophet model for forecasting."
+            })
+            continue
+        best_model_idx = mape_values.idxmin()
+        if pd.isna(best_model_idx):
+            print(f"[v1.20.136] Unable to determine best model for product {product}, using default strategy")
+            strategies.append({
+                'Product': product,
+                'Strategy': f"Unable to determine best model for {product} due to invalid MAPE values. Defaulting to Prophet model."
+            })
+            continue
+        best_model = product_results.loc[best_model_idx]
+        avg_pred = product_results['Avg_Quantity_Pred'].mean()
+        strategy = f"For product {product}, the best model is {best_model['Model']} with MAPE {best_model['MAPE']:.2f}%. "
+        if best_model['MAPE'] > 50:
+            strategy += "High prediction error detected. Consider increasing stock buffer by 20% to account for uncertainty."
+        elif avg_pred > product_results['Avg_Quantity_Real'].mean() * 1.5:
+            strategy += f"Demand is forecasted to increase significantly ({avg_pred:.2f} vs {product_results['Avg_Quantity_Real'].mean():.2f}). Plan for additional inventory and promotional campaigns."
+        else:
+            strategy += f"Stable demand forecasted ({avg_pred:.2f}). Maintain current inventory levels and monitor closely."
+        strategies.append({
+            'Product': product,
+            'Strategy': strategy
+        })
+    return strategies
+
+def generate_interesting_fact(predictions, products, hold_out_start, hold_out_end):
+    predictions_df = pd.DataFrame(predictions)
+    max_diff_product = None
+    max_diff = 0
+    sparse_products = []
+    for product in products:
+        product_preds = predictions_df[(predictions_df['product'] == product) & (predictions_df['period'] == 'Holdout') & (predictions_df['model'] != 'Actual')]
+        product_actuals = predictions_df[(predictions_df['product'] == product) & (predictions_df['model'] == 'Actual') & (predictions_df['period'] == 'Holdout')]
+        if product_preds.empty or product_actuals.empty:
+            print(f"[v1.20.136] Skipping product {product}: empty predictions ({len(product_preds)} rows) or actuals ({len(product_actuals)} rows)")
+            sparse_products.append(product)
+            continue
+        if 'actual' not in product_actuals.columns:
+            print(f"[v1.20.136] No 'actual' column for product {product} in actuals, skipping")
+            sparse_products.append(product)
+            continue
+        merged = product_preds.merge(product_actuals[['date', 'actual']], on='date', how='inner')
+        if merged.empty:
+            print(f"[v1.20.136] No matching data for product {product} after merge")
+            sparse_products.append(product)
+            continue
+        if 'predicted' not in merged.columns or 'actual' not in merged.columns:
+            print(f"[v1.20.136] Missing 'predicted' or 'actual' in merged DataFrame for product {product}")
+            sparse_products.append(product)
+            continue
+        diff = abs(merged['predicted'] - merged['actual']).mean()
+        if diff > max_diff:
+            max_diff = diff
+            max_diff_product = product
+    if max_diff_product:
+        return f"Product {max_diff_product} showed the largest prediction error in the holdout period, with an average absolute difference of {max_diff:.2f} units."
+    sparse_message = f"Sparse data for products: {', '.join(sparse_products)}." if sparse_products else "No data issues detected."
+    return f"No significant prediction errors observed in the holdout period due to insufficient data or missing actuals. {sparse_message}"
+
+def generate_summary_txt(timestamp, hold_out_start, hold_out_end, forecast_start, forecast_end):
+    summary = (
+        f"Sales Forecast Summary\n"
+        f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"Version: 1.20.136\n"
+        f"Holdout Period: {hold_out_start.strftime('%Y-%m-%d')} to {hold_out_end.strftime('%Y-%m-%d')}\n"
+        f"Forecast Period: {forecast_start.strftime('%Y-%m-%d')} to {forecast_end.strftime('%Y-%m-%d')}\n"
+        f"Models Used: Prophet, XGBoost, LightGBM, CatBoost, Ensemble\n"
+        f"Output Files:\n"
+        f"  - Model Comparison: outputs/model_comparison_{timestamp}.csv\n"
+        f"  - Daily Predictions: outputs/daily_predictions_{timestamp}.csv\n"
+        f"  - Weekly Predictions: outputs/weekly_predictions_{timestamp}.csv\n"
+        f"  - Feature Importance: outputs/feature_importance_{timestamp}.csv\n"
+        f"  - HTML Report: outputs/sales_forecast_report_{timestamp}.html\n"
+    )
+    os.makedirs('outputs', exist_ok=True)
+    with open(f'outputs/summary_{timestamp}.txt', 'w') as f:
+        f.write(summary)
+    print(f"[v1.20.136] Generated summary: outputs/summary_{timestamp}.txt")
+    return summary
+
+def format_df(df, period):
+    if df.empty:
+        return "<p>No data available for this period.</p>"
+    df = df.copy()
+    for col in ['Avg_Quantity_Pred', 'Avg_Quantity_Real', 'RMSE', 'MAE', 'MAPE', 'R2']:
+        if col in df.columns:
+            df[col] = df[col].apply(lambda x: f"{x:.2f}" if pd.notnull(x) else 'N/A')
+    if period == 'forecast':
+        df = df[['Product', 'Model', 'Avg_Quantity_Pred']]
+    html = "<table class='table-auto w-full border-collapse border border-gray-300'>\n<thead>\n<tr>"
+    for col in df.columns:
+        html += f"<th class='border border-gray-300 px-4 py-2'>{col}</th>"
+    html += "</tr>\n</thead>\n<tbody>"
+    for _, row in df.iterrows():
+        html += "\n<tr>"
+        for val in row:
+            html += f"<td class='border border-gray-300 px-4 py-2'>{val}</td>"
+        html += "</tr>"
+    html += "\n</tbody>\n</table>"
+    return html

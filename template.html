@@ -1,0 +1,705 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sales Forecast Report</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+    <style>
+        .tooltip {
+            position: relative;
+            display: inline-block;
+            cursor: help;
+        }
+        .tooltip .tooltiptext {
+            visibility: hidden;
+            width: 200px;
+            background-color: #333;
+            color: #fff;
+            text-align: center;
+            border-radius: 6px;
+            padding: 5px;
+            position: absolute;
+            z-index: 1000;
+            bottom: 125%;
+            left: 50%;
+            margin-left: -100px;
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+        .tooltip:hover .tooltiptext {
+            visibility: visible;
+            opacity: 1;
+        }
+        .best-model {
+            background-color: #d1fae5;
+            font-weight: bold;
+        }
+        table {
+            table-layout: fixed;
+            width: 100%;
+        }
+        th, td {
+            width: 12.5%;
+            padding: 8px;
+            text-align: left;
+            border: 1px solid #ddd;
+        }
+        .no-data {
+            text-align: center;
+            color: #e3342f;
+            font-style: italic;
+            padding: 20px;
+        }
+    </style>
+</head>
+<body class="bg-gray-100">
+    <div class="container mx-auto p-4">
+        <div class="bg-white shadow-md rounded-lg p-6">
+            <h1 class="text-3xl font-bold mb-4">Sales Forecast Report - {{ report_date }}</h1>
+            <p class="text-gray-600 mb-4">Version: {{ version }}</p>
+
+            {% if alerts %}
+            <div class="mb-6">
+                <h2 class="text-2xl font-semibold mb-2">Alerts</h2>
+                <ul class="list-disc pl-5">
+                    {% for alert in alerts %}
+                    <li class="text-red-600">{{ alert }}</li>
+                    {% endfor %}
+                </ul>
+            </div>
+            {% endif %}
+
+            {% if skipped_products %}
+            <div class="mb-6">
+                <h2 class="text-2xl font-semibold mb-2">Skipped Products</h2>
+                <p class="text-gray-600 mb-4">The following products were excluded due to insufficient data (no actual sales or predictions):</p>
+                <ul class="list-disc pl-5">
+                    {% for product in skipped_products %}
+                    <li class="text-red-600">{{ product }}</li>
+                    {% endfor %}
+                </ul>
+            </div>
+            {% endif %}
+
+            <h2 class="text-2xl font-semibold mb-2">Summary</h2>
+            <p class="text-gray-700 mb-4">{{ summary }}</p>
+
+            <h2 class="text-2xl font-semibold mb-2">Interesting Fact</h2>
+            <p class="text-gray-700 mb-4">{{ interesting_fact }}</p>
+
+            <h2 class="text-2xl font-semibold mb-2">Business Strategies</h2>
+            {% if business_strategies %}
+            <ul class="list-disc pl-5 mb-4">
+                {% for strategy in business_strategies %}
+                <li><strong>{{ strategy.Product }}:</strong> {{ strategy.Strategy }}</li>
+                {% endfor %}
+            </ul>
+            {% else %}
+            <p class="text-gray-600 mb-4">No business strategies available.</p>
+            {% endif %}
+
+            <h2 class="text-2xl font-semibold mb-2">Model Comparison: Hold-Out Period ({{ hold_out_start }} to {{ hold_out_end }})</h2>
+            {% if holdout_table %}
+            {{ holdout_table | safe }}
+            {% else %}
+            <table class="w-full mb-6 border table table-striped">
+                <thead>
+                    <tr class="bg-gray-200">
+                        <th class="py-2 px-4 border-b">Product</th>
+                        <th class="py-2 px-4 border-b">
+                            <span class="tooltip">Model<span class="tooltiptext">The predictive model used for forecasting.</span></span>
+                        </th>
+                        <th class="py-2 px-4 border-b">
+                            <span class="tooltip">RMSE<span class="tooltiptext">Root Mean Squared Error: Measures prediction error magnitude. Lower values indicate better accuracy.</span></span>
+                        </th>
+                        <th class="py-2 px-4 border-b">
+                            <span class="tooltip">R²<span class="tooltiptext">R-squared: Measures how well predictions explain actual data. Higher values (closer to 1) indicate better fit.</span></span>
+                        </th>
+                        <th class="py-2 px-4 border-b">
+                            <span class="tooltip">MAE<span class="tooltiptext">Mean Absolute Error: Average absolute prediction error. Lower values indicate better accuracy.</span></span>
+                        </th>
+                        <th class="py-2 px-4 border-b">
+                            <span class="tooltip">MAPE<span class="tooltiptext">Mean Absolute Percentage Error: Average percentage error. Lower values indicate better accuracy.</span></span>
+                        </th>
+                        <th class="py-2 px-4 border-b">Avg Predicted</th>
+                        <th class="py-2 px-4 border-b">Avg Actual</th>
+                    </tr>
+                </thead>
+                <tbody id="holdoutComparisonBody"></tbody>
+            </table>
+            {% endif %}
+            <p class="text-gray-600 italic mt-2">Rows highlighted in green indicate the best-performing model for each product in the hold-out period, based on the lowest MAPE. 'N/A' in MAPE indicates insufficient data for evaluation.</p>
+
+            <h2 class="text-2xl font-semibold mb-2">Hold-Out Period Predictions</h2>
+            <div id="holdoutChartContainer">
+                <div class="mb-4">
+                    <label for="holdoutProductSelect" class="mr-2">Select Product:</label>
+                    <select id="holdoutProductSelect" class="border rounded p-2">
+                        {% if all_products %}
+                        {% for product in all_products %}
+                        <option value="{{ product }}">{{ product }}</option>
+                        {% endfor %}
+                        {% else %}
+                        <option value="" disabled>No products available</option>
+                        {% endif %}
+                    </select>
+                </div>
+                <canvas id="holdoutChart" class="mb-6"></canvas>
+                <p id="holdoutChartNoData" class="no-data" style="display: none;">No data available for Hold-Out Period Predictions</p>
+            </div>
+
+            <h2 class="text-2xl font-semibold mb-2">Model Comparison: Forecast Period ({{ forecast_start }} to {{ forecast_end }})</h2>
+            {% if forecast_table %}
+            {{ forecast_table | safe }}
+            {% else %}
+            <table class="w-full mb-6 border table table-striped">
+                <thead>
+                    <tr class="bg-gray-200">
+                        <th class="py-2 px-4 border-b">Product</th>
+                        <th class="py-2 px-4 border-b">Model</th>
+                        <th class="py-2 px-4 border-b">Avg Predicted</th>
+                    </tr>
+                </thead>
+                <tbody id="forecastComparisonBody"></tbody>
+            </table>
+            {% endif %}
+
+            <h2 class="text-2xl font-semibold mb-2">Forecast Period Predictions</h2>
+            <div id="forecastChartContainer">
+                <div class="mb-4">
+                    <label for="forecastProductSelect" class="mr-2">Select Product:</label>
+                    <select id="forecastProductSelect" class="border rounded p-2">
+                        {% if all_products %}
+                        {% for product in all_products %}
+                        <option value="{{ product }}">{{ product }}</option>
+                        {% endfor %}
+                        {% else %}
+                        <option value="" disabled>No products available</option>
+                        {% endif %}
+                    </select>
+                </div>
+                <canvas id="forecastChart" class="mb-6"></canvas>
+                <p id="forecastChartNoData" class="no-data" style="display: none;">No data available for Forecast Period Predictions</p>
+            </div>
+
+            <h2 class="text-2xl font-semibold mb-2">Sales Drivers Summary</h2>
+            <table class="w-full mb-6 border table table-striped">
+                <thead>
+                    <tr class="bg-gray-200">
+                        <th class="py-2 px-4 border-b">Product</th>
+                        <th class="py-2 px-4 border-b">Top Features</th>
+                    </tr>
+                </thead>
+                <tbody id="featureImportanceBody"></tbody>
+            </table>
+
+            <h2 class="text-2xl font-semibold mb-2">Historical Actual Sales by Product</h2>
+            <p class="text-gray-600 italic mb-4">This chart displays actual sales data for the selected product from the earliest available date.</p>
+            <div id="actualChartContainer">
+                <div class="mb-4">
+                    <label for="actualProductSelect" class="mr-2">Select Product:</label>
+                    <select id="actualProductSelect" class="border rounded p-2">
+                        {% if all_products %}
+                        {% for product in all_products %}
+                        <option value="{{ product }}">{{ product }}</option>
+                        {% endfor %}
+                        {% else %}
+                        <option value="" disabled>No products available</option>
+                        {% endif %}
+                    </select>
+                </div>
+                <canvas id="actualChart" class="mb-6"></canvas>
+                <p id="actualChartNoData" class="no-data" style="display: none;">No actual sales data available for the selected product</p>
+            </div>
+
+            <h2 class="text-2xl font-semibold mb-2">Feature Importance Chart</h2>
+            <div class="mb-4">
+                <label for="featureProductSelect" class="mr-2">Select Product for Feature Importance Chart:</label>
+                <select id="featureProductSelect" class="border rounded p-2">
+                    <option value="All Products">All Products</option>
+                    {% if all_products %}
+                    {% for product in all_products %}
+                    <option value="{{ product }}">{{ product }}</option>
+                    {% endfor %}
+                    {% else %}
+                    <option value="" disabled>No products available</option>
+                    {% endif %}
+                </select>
+            </div>
+            <canvas id="featureImportanceChart" class="mb-6"></canvas>
+
+            <div id="debugJson" style="display: none;">{{ csv_data_json }}</div>
+            <div id="chartJson" style="display: none;">{{ chart_data_json }}</div>
+            <div id="featureJson" style="display: none;">{{ feature_insights_json }}</div>
+        </div>
+    </div>
+
+    <script>
+        let csvData = [];
+        let chartData = [];
+        let featureData = [];
+        try {
+            const debugJsonElement = document.getElementById('debugJson');
+            if (debugJsonElement) csvData = JSON.parse(debugJsonElement.textContent.trim());
+            console.log('Parsed csvData:', csvData.slice(0, 5));
+        } catch (e) { console.error('Error parsing csvDataRaw:', e); csvData = []; }
+        try {
+            const chartJsonElement = document.getElementById('chartJson');
+            if (chartJsonElement) chartData = JSON.parse(chartJsonElement.textContent.trim());
+            console.log('Parsed chartData:', chartData.slice(0, 5));
+        } catch (e) { console.error('Error parsing chartDataRaw:', e); chartData = []; }
+        try {
+            const featureJsonElement = document.getElementById('featureJson');
+            if (featureJsonElement) featureData = JSON.parse(featureJsonElement.textContent.trim());
+            console.log('Parsed featureData:', featureData.slice(0, 5));
+        } catch (e) { console.error('Error parsing featureDataRaw:', e); featureData = []; }
+
+        // Log earliest actual sales date across all products
+        const actualDates = chartData.filter(d => d.actual != null).map(d => new Date(d.date));
+        const earliestActualDate = actualDates.length ? new Date(Math.min(...actualDates)).toISOString().split('T')[0] : 'N/A';
+        console.log('Earliest actual sales date in chartData:', earliestActualDate);
+
+        const modelColors = { 'Actual': '#36A2EB', 'Prophet': '#8c564b', 'XGBoost': '#ff7f0e', 'LightGBM': '#ff1493', 'CatBoost': '#d62728', 'Ensemble': '#9467bd' };
+        // Dynamic product colors
+        const colorPalette = [
+            '#FF6384', // Red
+            '#36A2EB', // Blue
+            '#FFCE56', // Yellow
+            '#4BC0C0', // Teal
+            '#9966FF', // Purple
+            '#FF9F40', // Orange
+            '#C9CB3F', // Lime
+            '#FF6F61', // Coral
+            '#6B7280', // Gray
+            '#2ECC71'  // Green
+        ];
+        const availableProducts = [...new Set([...featureData.map(d => d.product), ...chartData.map(d => d.product), ...csvData.map(d => d.Product)].filter(p => p))];
+        const productColors = {};
+        availableProducts.forEach((product, index) => {
+            productColors[product] = colorPalette[index % colorPalette.length];
+        });
+        console.log('Assigned product colors:', productColors);
+
+        function populateTables() {
+            const holdoutTbody = document.getElementById('holdoutComparisonBody');
+            const forecastTbody = document.getElementById('forecastComparisonBody');
+            const featureTbody = document.getElementById('featureImportanceBody');
+            const selectedHoldoutProduct = document.getElementById('holdoutProductSelect')?.value;
+            const selectedForecastProduct = document.getElementById('forecastProductSelect')?.value;
+
+            if (!holdoutTbody || !forecastTbody || !featureTbody) {
+                console.error('Missing table body elements');
+                return;
+            }
+
+            // Skip dynamic population if static tables are provided
+            if (document.querySelector('.table.table-striped')) {
+                console.log('Using static holdout_table and forecast_table from template');
+                return;
+            }
+
+            holdoutTbody.innerHTML = '';
+            forecastTbody.innerHTML = '';
+            featureTbody.innerHTML = '';
+
+            if (csvData.length === 0) {
+                holdoutTbody.innerHTML = '<tr><td colspan="8" class="py-2 px-4 border-b text-center text-red-600">No data available</td></tr>';
+                forecastTbody.innerHTML = '<tr><td colspan="3" class="py-2 px-4 border-b text-center text-red-600">No data available</td></tr>';
+                console.log('No csvData available');
+            } else {
+                const bestModels = {};
+                csvData.forEach(row => {
+                    if (row.Period === 'Holdout') {
+                        const product = row.Product;
+                        if (!bestModels[product] || (row.MAPE !== null && !isNaN(row.MAPE) && row.MAPE < bestModels[product].MAPE)) {
+                            bestModels[product] = { Model: row.Model, MAPE: row.MAPE || Infinity };
+                        }
+                    }
+                });
+                console.log('Best models:', bestModels);
+
+                const aggregatedData = {};
+                csvData.forEach(row => {
+                    const key = `${row.Product}-${row.Model}-${row.Period}`;
+                    if (!aggregatedData[key]) aggregatedData[key] = { ...row, count: 1 };
+                    else {
+                        aggregatedData[key].RMSE = (aggregatedData[key].RMSE * aggregatedData[key].count + row.RMSE) / (aggregatedData[key].count + 1);
+                        aggregatedData[key].R2 = (aggregatedData[key].R2 * aggregatedData[key].count + row.R2) / (aggregatedData[key].count + 1);
+                        aggregatedData[key].MAE = (aggregatedData[key].MAE * aggregatedData[key].count + row.MAE) / (aggregatedData[key].count + 1);
+                        aggregatedData[key].MAPE = (aggregatedData[key].MAPE * aggregatedData[key].count + row.MAPE) / (aggregatedData[key].count + 1);
+                        aggregatedData[key].Avg_Quantity_Pred = (aggregatedData[key].Avg_Quantity_Pred * aggregatedData[key].count + row.Avg_Quantity_Pred) / (aggregatedData[key].count + 1);
+                        aggregatedData[key].Avg_Quantity_Real = (aggregatedData[key].Avg_Quantity_Real * aggregatedData[key].count + row.Avg_Quantity_Real) / (aggregatedData[key].count + 1);
+                        aggregatedData[key].count++;
+                    }
+                });
+                const uniqueData = Object.values(aggregatedData);
+                console.log('Unique csvData:', uniqueData.slice(0, 5));
+
+                uniqueData.forEach(row => {
+                    const tr = document.createElement('tr');
+                    tr.className = 'border-b';
+                    if (row.Period === 'Holdout' && bestModels[row.Product] && bestModels[row.Product].Model === row.Model) tr.classList.add('best-model');
+                    if (row.Period === 'Holdout' && row.Product === selectedHoldoutProduct) {
+                        const mapeValue = row.MAPE != null && !isNaN(row.MAPE) ? row.MAPE.toFixed(2) : 'N/A';
+                        const mapeClass = mapeValue !== 'N/A' && row.MAPE <= 20 ? 'text-green-600' : 'text-red-600';
+                        const r2Class = row.R2 != null && !isNaN(row.R2) && row.R2 >= 0.7 ? 'text-green-600' : 'text-red-600';
+                        tr.innerHTML = `<td class="py-2 px-4">${row.Product || 'N/A'}</td><td class="py-2 px-4">${row.Model || 'N/A'}</td><td class="py-2 px-4">${row.RMSE != null && !isNaN(row.RMSE) ? row.RMSE.toFixed(2) : 'N/A'}</td><td class="py-2 px-4 ${r2Class}">${row.R2 != null && !isNaN(row.R2) ? row.R2.toFixed(2) : 'N/A'}</td><td class="py-2 px-4">${row.MAE != null && !isNaN(row.MAE) ? row.MAE.toFixed(2) : 'N/A'}</td><td class="py-2 px-4 ${mapeClass}">${mapeValue}%</td><td class="py-2 px-4">${row.Avg_Quantity_Pred != null && !isNaN(row.Avg_Quantity_Pred) ? row.Avg_Quantity_Pred.toFixed(2) : 'N/A'}</td><td class="py-2 px-4">${row.Avg_Quantity_Real != null && !isNaN(row.Avg_Quantity_Real) ? row.Avg_Quantity_Real.toFixed(2) : 'N/A'}</td>`;
+                        holdoutTbody.appendChild(tr);
+                    } else if (row.Period === 'Forecast' && row.Product === selectedForecastProduct) {
+                        tr.innerHTML = `<td class="py-2 px-4">${row.Product || 'N/A'}</td><td class="py-2 px-4">${row.Model || 'N/A'}</td><td class="py-2 px-4">${row.Avg_Quantity_Pred != null && !isNaN(row.Avg_Quantity_Pred) ? row.Avg_Quantity_Pred.toFixed(2) : 'N/A'}</td>`;
+                        forecastTbody.appendChild(tr);
+                    }
+                });
+            }
+
+            if (!Array.isArray(featureData) || featureData.length === 0) {
+                featureTbody.innerHTML = '<tr><td colspan="2" class="py-2 px-4 border-b text-center text-red-600">No feature importance data</td></tr>';
+                console.log('No featureData available');
+            } else {
+                featureData.forEach(item => {
+                    if (!item.product || !item.top_features || !Array.isArray(item.top_features)) {
+                        console.warn(`Invalid feature data for ${item.product || 'unknown'}:`, item);
+                        return;
+                    }
+                    const tr = document.createElement('tr');
+                    tr.className = 'border-b';
+                    const topFeatures = item.top_features.map(f => `${f.Feature}: ${(f.Importance * 100).toFixed(1)}%`).join(', ');
+                    tr.innerHTML = `<td class="py-2 px-4">${item.product}</td><td class="py-2 px-4">${topFeatures || 'No significant features'}</td>`;
+                    featureTbody.appendChild(tr);
+                });
+            }
+        }
+
+        function updateCharts() {
+            const holdoutProductSelect = document.getElementById('holdoutProductSelect');
+            const forecastProductSelect = document.getElementById('forecastProductSelect');
+            const featureProductSelect = document.getElementById('featureProductSelect');
+            const actualProductSelect = document.getElementById('actualProductSelect');
+            if (!holdoutProductSelect || !forecastProductSelect || !featureProductSelect || !actualProductSelect) {
+                console.error('Missing select elements');
+                return;
+            }
+
+            // Get available products from chartData or select options
+            const availableProducts = [...new Set(chartData.map(d => d.product).filter(p => p))];
+            const defaultProduct = availableProducts.length > 0 ? availableProducts[0] : null;
+
+            const selectedHoldoutProduct = holdoutProductSelect.value || defaultProduct;
+            const selectedForecastProduct = forecastProductSelect.value || defaultProduct;
+            const selectedFeatureProduct = featureProductSelect.value || 'All Products';
+            const selectedActualProduct = actualProductSelect.value || defaultProduct;
+            console.log('Selected holdout product:', selectedHoldoutProduct);
+            console.log('Selected forecast product:', selectedForecastProduct);
+            console.log('Selected feature product:', selectedFeatureProduct);
+            console.log('Selected actual product:', selectedActualProduct);
+
+            let holdoutCtx = document.getElementById('holdoutChart')?.getContext('2d');
+            let forecastCtx = document.getElementById('forecastChart')?.getContext('2d');
+            let featureCtx = document.getElementById('featureImportanceChart')?.getContext('2d');
+            let actualCtx = document.getElementById('actualChart')?.getContext('2d');
+            if (!holdoutCtx || !forecastCtx || !featureCtx || !actualCtx) {
+                console.error('Missing chart canvas elements');
+                return;
+            }
+
+            if (window.holdoutChartInstance) window.holdoutChartInstance.destroy();
+            if (window.forecastChartInstance) window.forecastChartInstance.destroy();
+            if (window.featureChartInstance) window.featureChartInstance.destroy();
+            if (window.actualChartInstance) window.actualChartInstance.destroy();
+
+            // Modified deduplication to preserve all actual values
+            const uniqueChartData = [];
+            const seen = new Map();
+            chartData.forEach(d => {
+                if (!d.product || !d.date || !d.model) {
+                    console.warn('Invalid chart data entry:', d);
+                    return;
+                }
+                const key = `${d.product}-${d.date}-${d.model}`;
+                if (!seen.has(key)) {
+                    seen.set(key, d);
+                    uniqueChartData.push(d);
+                } else if (d.actual != null && !isNaN(d.actual)) {
+                    // Prefer entries with non-null actual values
+                    const existing = seen.get(key);
+                    if (existing.actual == null || isNaN(existing.actual)) {
+                        seen.set(key, d);
+                        const index = uniqueChartData.findIndex(item => item.product === d.product && item.date === d.date && item.model === d.model);
+                        if (index !== -1) uniqueChartData[index] = d;
+                    }
+                }
+            });
+            console.log('Unique chartData:', uniqueChartData.slice(0, 5));
+
+            // Log actual sales data for the selected product
+            const productActualDates = chartData
+                .filter(d => d.actual != null && !isNaN(d.actual) && d.product === selectedActualProduct)
+                .map(d => new Date(d.date));
+            const earliestProductActualDate = productActualDates.length 
+                ? new Date(Math.min(...productActualDates)).toISOString().split('T')[0] 
+                : 'N/A';
+            console.log(`Earliest actual sales date for ${selectedActualProduct}: ${earliestProductActualDate}`);
+
+            // Holdout Chart
+            const holdoutData = uniqueChartData.filter(d => (d.period === 'Holdout' || d.period === 'Hold-Out') && d.product === selectedHoldoutProduct);
+            console.log('Holdout data for', selectedHoldoutProduct, ':', holdoutData.length, 'entries', holdoutData.slice(0, 5));
+            const holdoutDatasets = [];
+            const holdoutAddedModels = new Set();
+            const holdoutActualPoints = holdoutData.filter(d => d.actual != null && !isNaN(d.actual)).map(d => ({ x: d.date, y: d.actual }));
+            console.log('Holdout actual points:', holdoutActualPoints.length, holdoutActualPoints.slice(0, 5));
+            if (holdoutActualPoints.length) {
+                holdoutDatasets.push({
+                    label: 'Actual',
+                    data: holdoutActualPoints,
+                    borderColor: modelColors['Actual'],
+                    backgroundColor: 'rgba(0,0,0,0.1)',
+                    fill: false,
+                    borderWidth: 2,
+                    tension: 0.1,
+                    borderDash: [10, 10]
+                });
+            }
+            holdoutData.forEach(d => {
+                const key = `${d.product}-${d.period}-${d.model}`;
+                if (!holdoutAddedModels.has(key) && d.predicted != null && !isNaN(d.predicted)) {
+                    const modelData = holdoutData.filter(x => x.model === d.model && x.product === d.product && x.period === d.period)
+                        .map(x => ({ x: x.date, y: x.predicted }))
+                        .sort((a, b) => new Date(a.x) - new Date(b.x));
+                    holdoutDatasets.push({
+                        label: `${d.model} (${d.product})`,
+                        data: modelData,
+                        borderColor: modelColors[d.model] || '#000000',
+                        backgroundColor: 'rgba(0,0,0,0.1)',
+                        fill: false,
+                        tension: 0.3,
+                        borderWidth: 2
+                    });
+                    holdoutAddedModels.add(key);
+                }
+            });
+            console.log('Holdout datasets:', holdoutDatasets.length, holdoutDatasets.map(d => ({ label: d.label, dataLength: d.data.length })));
+
+            const holdoutChartNoData = document.getElementById('holdoutChartNoData');
+            if (!selectedHoldoutProduct || holdoutDatasets.length === 0) {
+                holdoutChartNoData.style.display = 'block';
+                document.getElementById('holdoutChart').style.display = 'none';
+                console.warn(`No holdout data for ${selectedHoldoutProduct || 'no product selected'}`);
+            } else {
+                holdoutChartNoData.style.display = 'none';
+                document.getElementById('holdoutChart').style.display = 'block';
+                window.holdoutChartInstance = new Chart(holdoutCtx, {
+                    type: 'line',
+                    data: { datasets: holdoutDatasets },
+                    options: {
+                        responsive: true,
+                        scales: { 
+                            x: { type: 'time', time: { unit: 'day' }, title: { display: true, text: 'Date' } }, 
+                            y: { beginAtZero: true, title: { display: true, text: 'Quantity' } } 
+                        },
+                        plugins: { 
+                            legend: { display: true }, 
+                            title: { display: true, text: `Hold-Out Period Predictions for ${selectedHoldoutProduct}` }, 
+                            tooltip: { mode: 'index', intersect: false, callbacks: { label: ctx => `${ctx.dataset.label}: ${ctx.parsed.y?.toFixed(2) || '0.00'}` } } 
+                        }
+                    }
+                });
+            }
+
+            // Forecast Chart
+            const forecastData = uniqueChartData.filter(d => d.period === 'Forecast' && d.product === selectedForecastProduct);
+            console.log('Forecast data for', selectedForecastProduct, ':', forecastData.length, 'entries', forecastData.slice(0, 5));
+            const forecastDatasets = [];
+            const forecastAddedModels = new Set();
+            forecastData.forEach(d => {
+                const key = `${d.product}-${d.period}-${d.model}`;
+                if (!forecastAddedModels.has(key) && d.predicted != null && !isNaN(d.predicted)) {
+                    const modelData = forecastData.filter(x => x.model === d.model && x.product === d.product && x.period === d.period)
+                        .map(x => ({ x: x.date, y: x.predicted }))
+                        .sort((a, b) => new Date(a.x) - new Date(b.x));
+                    forecastDatasets.push({
+                        label: `${d.model} (${d.product})`,
+                        data: modelData,
+                        borderColor: modelColors[d.model] || '#000000',
+                        backgroundColor: 'rgba(0,0,0,0.1)',
+                        fill: false,
+                        tension: 0.3,
+                        borderWidth: 2
+                    });
+                    forecastAddedModels.add(key);
+                }
+            });
+            console.log('Forecast datasets:', forecastDatasets.length, forecastDatasets.map(d => ({ label: d.label, dataLength: d.data.length })));
+
+            const forecastChartNoData = document.getElementById('forecastChartNoData');
+            if (!selectedForecastProduct || forecastDatasets.length === 0) {
+                forecastChartNoData.style.display = 'block';
+                document.getElementById('forecastChart').style.display = 'none';
+                console.warn(`No forecast data for ${selectedForecastProduct || 'no product selected'}`);
+            } else {
+                forecastChartNoData.style.display = 'none';
+                document.getElementById('forecastChart').style.display = 'block';
+                window.forecastChartInstance = new Chart(forecastCtx, {
+                    type: 'line',
+                    data: { datasets: forecastDatasets },
+                    options: {
+                        responsive: true,
+                        scales: { 
+                            x: { type: 'time', time: { unit: 'day' }, title: { display: true, text: 'Date' } }, 
+                            y: { beginAtZero: true, title: { display: true, text: 'Quantity' } } 
+                        },
+                        plugins: { 
+                            legend: { display: true }, 
+                            title: { display: true, text: `Forecast Period Predictions for ${selectedForecastProduct}` }, 
+                            tooltip: { mode: 'index', intersect: false, callbacks: { label: ctx => `${ctx.dataset.label}: ${ctx.parsed.y?.toFixed(2) || '0.00'}` } } 
+                        }
+                    }
+                });
+            }
+
+            // Actual Sales Chart
+            const actualData = uniqueChartData.filter(d => d.product === selectedActualProduct);
+            console.log('Actual data for', selectedActualProduct, ':', actualData.length, 'entries', actualData.slice(0, 5));
+
+            // Get all dates in the range for the selected product
+            const productDates = actualData.map(d => new Date(d.date));
+            const minDate = productDates.length ? new Date(Math.min(...productDates)).toISOString().split('T')[0] : 'N/A';
+            const maxDate = productDates.length ? new Date(Math.max(...productDates)).toISOString().split('T')[0] : 'N/A';
+            console.log(`Actual sales date range for ${selectedActualProduct}: ${minDate} to ${maxDate}`);
+
+            // Create a map of actual sales by date
+            const actualMap = new Map();
+            actualData.filter(d => d.actual != null && !isNaN(d.actual)).forEach(d => {
+                actualMap.set(d.date, d.actual);
+            });
+
+            // Generate complete date range with 0 for no-sale days
+            const dateRange = [];
+            if (minDate !== 'N/A' && maxDate !== 'N/A') {
+                let currentDate = new Date(minDate);
+                const endDate = new Date(maxDate);
+                while (currentDate <= endDate) {
+                    const dateStr = currentDate.toISOString().split('T')[0];
+                    dateRange.push({
+                        x: dateStr,
+                        y: actualMap.has(dateStr) ? actualMap.get(dateStr) : 0
+                    });
+                    currentDate.setDate(currentDate.getDate() + 1);
+                }
+            }
+            console.log('Actual date range points:', dateRange.length, dateRange.slice(0, 5));
+
+            // Determine time unit based on date range
+            const dateRangeDays = productDates.length ? (Math.max(...productDates) - Math.min(...productDates)) / (1000 * 60 * 60 * 24) : 0;
+            const timeUnit = dateRangeDays > 365 ? 'month' : 'day';
+
+            const actualDatasets = dateRange.length ? [{
+                label: `Actual Sales (${selectedActualProduct})`,
+                data: dateRange,
+                borderColor: productColors[selectedActualProduct] || colorPalette[0],
+                backgroundColor: 'rgba(0,0,0,0.1)',
+                fill: false,
+                borderWidth: 2,
+                tension: 0.1
+            }] : [];
+
+            const actualChartNoData = document.getElementById('actualChartNoData');
+            if (!selectedActualProduct || !dateRange.length) {
+                actualChartNoData.style.display = 'block';
+                document.getElementById('actualChart').style.display = 'none';
+                console.warn(`No actual sales data for ${selectedActualProduct || 'no product selected'}`);
+            } else {
+                actualChartNoData.style.display = 'none';
+                document.getElementById('actualChart').style.display = 'block';
+                window.actualChartInstance = new Chart(actualCtx, {
+                    type: 'line',
+                    data: { datasets: actualDatasets },
+                    options: {
+                        responsive: true,
+                        scales: { 
+                            x: { 
+                                type: 'time', 
+                                time: { unit: timeUnit }, 
+                                title: { display: true, text: 'Date' },
+                                min: minDate,
+                                max: maxDate
+                            }, 
+                            y: { beginAtZero: true, title: { display: true, text: 'Quantity' } } 
+                        },
+                        plugins: { 
+                            legend: { display: true }, 
+                            title: { display: true, text: `Historical Actual Sales for ${selectedActualProduct}` }, 
+                            tooltip: { mode: 'index', intersect: false, callbacks: { label: ctx => `${ctx.dataset.label}: ${ctx.parsed.y?.toFixed(2) || '0.00'}` } } 
+                        }
+                    }
+                });
+            }
+
+            // Feature Importance Chart
+            const featureDataFiltered = selectedFeatureProduct === 'All Products' ? featureData : featureData.filter(d => d.product === selectedFeatureProduct);
+            console.log('Feature data filtered:', featureDataFiltered.length, featureDataFiltered.slice(0, 5));
+            let featureDatasets = [];
+            let featureLabels = [];
+            if (featureDataFiltered.length === 0 || !featureDataFiltered.every(item => item.top_features && Array.isArray(item.top_features))) {
+                console.warn(`No valid feature importance data for ${selectedFeatureProduct}`);
+                featureDatasets = [{
+                    label: 'No Data',
+                    data: [],
+                    backgroundColor: '#ccc',
+                    borderColor: '#ccc',
+                    hidden: false
+                }];
+                featureLabels = [];
+            } else {
+                featureDatasets = featureDataFiltered.map(item => ({
+                    label: item.product,
+                    data: item.top_features.map(f => f.Importance * 100),
+                    backgroundColor: productColors[item.product] || colorPalette[0],
+                    borderColor: productColors[item.product] || colorPalette[0],
+                    hidden: false
+                }));
+                featureLabels = featureDataFiltered[0].top_features.map(f => f.Feature);
+            }
+            console.log('Feature datasets:', featureDatasets.length, featureDatasets.map(d => ({ label: d.label, dataLength: d.data.length })));
+
+            window.featureChartInstance = new Chart(featureCtx, {
+                type: 'bar',
+                data: { 
+                    labels: featureLabels, 
+                    datasets: featureDatasets 
+                },
+                options: {
+                    responsive: true,
+                    scales: { 
+                        x: { title: { display: true, text: 'Feature' } }, 
+                        y: { beginAtZero: true, title: { display: true, text: 'Importance (%)' } } 
+                    },
+                    plugins: { 
+                        legend: { display: true }, 
+                        title: { display: true, text: `Feature Importance for ${selectedFeatureProduct}` }, 
+                        tooltip: { callbacks: { label: ctx => `${ctx.dataset.label}: ${ctx.parsed.y?.toFixed(1) || '0.0'}%` } } 
+                    }
+                }
+            });
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            const holdoutProductSelect = document.getElementById('holdoutProductSelect');
+            const forecastProductSelect = document.getElementById('forecastProductSelect');
+            const featureProductSelect = document.getElementById('featureProductSelect');
+            const actualProductSelect = document.getElementById('actualProductSelect');
+            if (holdoutProductSelect && forecastProductSelect && featureProductSelect && actualProductSelect) {
+                populateTables();
+                updateCharts();
+                [holdoutProductSelect, forecastProductSelect, featureProductSelect, actualProductSelect].forEach(select => {
+                    select.addEventListener('change', () => { populateTables(); updateCharts(); });
+                });
+            } else {
+                console.error('Missing select elements on DOMContentLoaded');
+            }
+        });
+    </script>
+</body>
+</html>

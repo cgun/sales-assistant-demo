@@ -1,0 +1,35 @@
+version: 1.20.136
+input_file: textile_sales_data_synthetic_br.csv
+output_dir: outputs
+features:
+  tree_features: ['holiday', 'campaign_intensity', 'season', 'lag_1', 'lag_7', 'rolling_mean_7', 'rolling_std_7', 'lag_1_missing', 'lag_7_missing', 'zero_sale_indicator']
+  prophet_regressors: ['holiday', 'campaign_intensity', 'season']
+  display_features: ['holiday', 'campaign_intensity', 'season', 'lag_1', 'lag_7']
+  zero_sale_thresholds:
+    campaign_intensity: 0.3
+    lag_1: 0.1
+  holdout_feature_strategy: static
+data:
+  required_columns: ['date', 'product_id', 'quantity', 'netprice', 'price', 'discount', 'discountapplied', 'season', 'campaign_intensity']
+  columns_to_drop: []
+  holiday_columns: ['ds', 'holiday']
+periods:
+  holdout_days: 90  
+  forecast_days: 30
+model_params:
+  prophet:
+    yearly_seasonality: true
+    weekly_seasonality: true
+    daily_seasonality: true
+  xgboost:
+    n_estimators: [50, 100, 200]
+    max_depth: [3, 5, 7]
+    learning_rate: [0.01, 0.1, 0.3]
+  lightgbm:
+    n_estimators: [50, 100, 200]
+    max_depth: [3, 5, 7]
+    learning_rate: [0.01, 0.1, 0.3]
+  catboost:
+    iterations: [50, 100, 200]
+    depth: [4, 6, 8]
+    learning_rate: [0.01, 0.1, 0.3]
