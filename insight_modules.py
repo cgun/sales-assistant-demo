@@ -56,7 +56,7 @@ def get_default_result(product, period):
         'RMSE': None,
         'R2': None,
         'MAE': None,
-        'MAPE': None,
+        'SMAPE': None,
         'Avg_Quantity_Real': 0.0
     }
 
@@ -93,26 +93,26 @@ def generate_business_strategies(results, products):
                 'Strategy': f"No sufficient data for {product}. Consider collecting more data or reviewing holdout period."
             })
             continue
-        mape_values = product_results['MAPE']
-        if mape_values.isna().all() or product_results.empty:
-            print(f"[v1.20.136] All MAPE values are NaN for product {product}, using default strategy")
+        smape_values = product_results['SMAPE']  # MAPE → SMAPE
+        if smape_values.isna().all() or product_results.empty:
+            print(f"[v1.20.136] All SMAPE values are NaN for product {product}, using default strategy")
             strategies.append({
                 'Product': product,
                 'Strategy': f"Insufficient holdout data for {product}. Defaulting to Prophet model for forecasting."
             })
             continue
-        best_model_idx = mape_values.idxmin()
+        best_model_idx = smape_values.idxmin()
         if pd.isna(best_model_idx):
             print(f"[v1.20.136] Unable to determine best model for product {product}, using default strategy")
             strategies.append({
                 'Product': product,
-                'Strategy': f"Unable to determine best model for {product} due to invalid MAPE values. Defaulting to Prophet model."
+                'Strategy': f"Unable to determine best model for {product} due to invalid SMAPE values. Defaulting to Prophet model."
             })
             continue
         best_model = product_results.loc[best_model_idx]
         avg_pred = product_results['Avg_Quantity_Pred'].mean()
-        strategy = f"For product {product}, the best model is {best_model['Model']} with MAPE {best_model['MAPE']:.2f}%. "
-        if best_model['MAPE'] > 50:
+        strategy = f"For product {product}, the best model is {best_model['Model']} with SMAPE {best_model['SMAPE']:.2f}%. "
+        if best_model['SMAPE'] > 50:
             strategy += "High prediction error detected. Consider increasing stock buffer by 20% to account for uncertainty."
         elif avg_pred > product_results['Avg_Quantity_Real'].mean() * 1.5:
             strategy += f"Demand is forecasted to increase significantly ({avg_pred:.2f} vs {product_results['Avg_Quantity_Real'].mean():.2f}). Plan for additional inventory and promotional campaigns."

@@ -69,10 +69,8 @@ def load_data():
         columns_to_drop = [col for col in df.columns if col in COLUMNS_TO_DROP]
         if columns_to_drop:
             df = df.drop(columns=columns_to_drop)
-        initial_rows = len(df)
-        df = df[df['quantity'] > 0]
-        print(f"[v{VERSION}] Loaded data: {len(df)} rows, products: {list(df['product_id'].unique())}, "
-              f"zero quantity ratio: {(initial_rows - len(df)) / initial_rows:.2f}")
+        df['is_zero_sale'] = (df['quantity'] == 0).astype(int)  # Zero-sale flag
+        print(f"[v{VERSION}] Loaded data: {len(df)} rows, zero-sale ratio: {df['is_zero_sale'].mean():.2f}")
         return df
     except Exception as e:
         print(f"[v{VERSION}] Error loading data: {type(e).__name__}: {str(e)}")
@@ -405,34 +403,35 @@ def save_weekly_predictions(product, models, hold_out_start, hold_out_end, forec
                 })
     return weekly_data
 
+def smape(actual, predicted):
+    return 100 * np.mean(2 * np.abs(predicted - actual) / (np.abs(actual) + np.abs(predicted) + 1e-10))
+
 def evaluate_model(product_df, predictions, start_date, end_date, model_name, hold_out_start):
     period = 'Holdout' if start_date == hold_out_start else 'Forecast'
     product_id = product_df['product_id'].iloc[0] if not product_df.empty else 'unknown'
+    
     if predictions.empty or 'ds' not in predictions.columns or 'yhat' not in predictions.columns:
         print(f"[v{VERSION}] Warning: Invalid predictions for {model_name} for product {product_id} in {period} period")
-        return {
-            'Product': product_id,
-            'Model': model_name,
-            'Period': period,
-            'Avg_Quantity_Pred': 0.0,
-            'RMSE': None,
-            'R2': None,
-            'MAE': None,
-            'MAPE': None,
-            'Avg_Quantity_Real': 0.0
-        }
+        return get_default_result(product_id, period)
+    
     predictions = predictions.copy()
-    predictions['ds'] = pd.to_datetime(predictions['ds']).dt.normalize()
+    predictions['ds'] = pd.to_datetime(predictions['ds'], errors='coerce').dt.normalize()
     actuals = product_df[product_df['date'].between(start_date, end_date)][['date', 'quantity']].copy()
-    actuals['date'] = pd.to_datetime(actuals['date']).dt.normalize()
+    actuals['date'] = pd.to_datetime(actuals['date'], errors='coerce').dt.normalize()
+    
+    # Log data sizes before merge
+    print(f"[v{VERSION}] Product {product_id}: Actuals rows={len(actuals)}, Predictions rows={len(predictions)}")
+    
     period_predictions = predictions[predictions['ds'].between(start_date, end_date)].copy()
+    
     metrics = {
         'Product': product_id,
         'Model': model_name,
         'Period': period,
         'Avg_Quantity_Pred': period_predictions['yhat'].mean() if not period_predictions.empty else 0.0
     }
-    if period == 'Holdout':
+    
+    if period == 'Holdout' and not actuals.empty:
         merged = period_predictions.merge(actuals, left_on='ds', right_on='date', how='inner')
         if merged.empty:
             print(f"[v{VERSION}] No matching data for {model_name} for product {product_id} in {period} period: "
@@ -441,25 +440,37 @@ def evaluate_model(product_df, predictions, start_date, end_date, model_name, ho
                 'RMSE': None,
                 'R2': None,
                 'MAE': None,
-                'MAPE': None,
+                'SMAPE': None,
                 'Avg_Quantity_Real': 0.0
             })
         else:
-            metrics.update({
-                'RMSE': np.sqrt(mean_squared_error(merged['quantity'], merged['yhat'])),
-                'R2': r2_score(merged['quantity'], merged['yhat']) if len(merged) > 1 else 0.0,
-                'MAE': mean_absolute_error(merged['quantity'], merged['yhat']),
-                'MAPE': np.mean(np.abs((merged['quantity'] - merged['yhat']) / (merged['quantity'] + 1e-10))) * 100,
-                'Avg_Quantity_Real': merged['quantity'].mean()
-            })
+            # Check for required columns
+            if 'quantity' not in merged.columns or 'yhat' not in merged.columns:
+                print(f"[v{VERSION}] Missing 'quantity' or 'yhat' in merged DataFrame for product {product_id}")
+                metrics.update({
+                    'RMSE': None,
+                    'R2': None,
+                    'MAE': None,
+                    'SMAPE': None,
+                    'Avg_Quantity_Real': 0.0
+                })
+            else:
+                metrics.update({
+                    'RMSE': np.sqrt(mean_squared_error(merged['quantity'], merged['yhat'])),
+                    'R2': r2_score(merged['quantity'], merged['yhat']) if len(merged) > 1 else 0.0,
+                    'MAE': mean_absolute_error(merged['quantity'], merged['yhat']),
+                    'SMAPE': smape(merged['quantity'], merged['yhat']),
+                    'Avg_Quantity_Real': merged['quantity'].mean()
+                })
     else:
         metrics.update({
             'RMSE': None,
             'R2': None,
             'MAE': None,
-            'MAPE': None,
+            'SMAPE': None,
             'Avg_Quantity_Real': 0.0
         })
+    
     return metrics
 
 def generate_html_report(timestamp, template_vars):
@@ -598,7 +609,7 @@ def main():
     daily_predictions = []
     weekly_predictions = []
     feature_insights = []
-    high_mape_products = []
+    high_smape_products = []
     sparse_products = []
     
     for product in products:
@@ -679,10 +690,11 @@ def main():
         model_weights = {}
         for name, pred in predictions.items():
             metrics = evaluate_model(product_df, pred, hold_out_start, hold_out_end, name, hold_out_start)
-            mape = metrics['MAPE'] if pd.notnull(metrics['MAPE']) else 100.0
-            if mape > 100:
-                high_mape_products.append(product)
-            model_weights[name] = 1.0 / max(mape, 1e-10)
+            #mape = metrics['MAPE'] if pd.notnull(metrics['MAPE']) else 100.0
+            smape = metrics['SMAPE'] if pd.notnull(metrics['SMAPE']) else 100.0
+            if smape > 100:
+                high_smape_products.append(product)
+            model_weights[name] = 1.0 / max(smape, 1e-10)
             results.append(metrics)
             results.append(evaluate_model(product_df, pred, forecast_start, forecast_end, name, hold_out_start))
         
@@ -757,7 +769,7 @@ def main():
     template_vars = {
         'report_date': start_time.strftime('%B %d, %Y'),
         'version': VERSION,
-        'alerts': generate_alerts(high_mape_products, sparse_products),
+        'alerts': generate_alerts(high_smape_products, sparse_products),
         'summary': generate_summary_txt(timestamp, hold_out_start, hold_out_end, forecast_start, forecast_end),
         'interesting_fact': generate_interesting_fact(daily_predictions, products, hold_out_start, hold_out_end),
         'business_strategies': generate_business_strategies(results, products),

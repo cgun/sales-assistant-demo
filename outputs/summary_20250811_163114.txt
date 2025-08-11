@@ -1,0 +1,12 @@
+Sales Forecast Summary
+Generated on: 2025-08-11 16:34:55
+Version: 1.20.136
+Holdout Period: 2025-02-20 to 2025-05-21
+Forecast Period: 2025-05-22 to 2025-06-21
+Models Used: Prophet, XGBoost, LightGBM, CatBoost, Ensemble
+Output Files:
+  - Model Comparison: outputs/model_comparison_20250811_163114.csv
+  - Daily Predictions: outputs/daily_predictions_20250811_163114.csv
+  - Weekly Predictions: outputs/weekly_predictions_20250811_163114.csv
+  - Feature Importance: outputs/feature_importance_20250811_163114.csv
+  - HTML Report: outputs/sales_forecast_report_20250811_163114.html
