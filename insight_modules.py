@@ -124,6 +124,7 @@ def generate_business_strategies(results, products):
             'Strategy': strategy
         })
     return strategies
+    
 
 def generate_interesting_fact(predictions, products, hold_out_start, hold_out_end):
     predictions_df = pd.DataFrame(predictions)
