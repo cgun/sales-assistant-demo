@@ -69,7 +69,7 @@ def load_data():
         columns_to_drop = [col for col in df.columns if col in COLUMNS_TO_DROP]
         if columns_to_drop:
             df = df.drop(columns=columns_to_drop)
-        df['is_zero_sale'] = (df['quantity'] == 0).astype(int)  # Zero-sale flag
+        df['is_zero_sale'] = (df['quantity'] == 0).astype(int)
         print(f"[v{VERSION}] Loaded data: {len(df)} rows, zero-sale ratio: {df['is_zero_sale'].mean():.2f}")
         return df
     except Exception as e:
@@ -412,18 +412,18 @@ def evaluate_model(product_df, predictions, start_date, end_date, model_name, ho
     period = 'Holdout' if start_date == hold_out_start else 'Forecast'
     product_id = product_df['product_id'].iloc[0] if not product_df.empty else 'unknown'
     
-    # Validate predictions
+    # Validate inputs
     if predictions.empty or 'ds' not in predictions.columns or 'yhat' not in predictions.columns:
-        print(f"[v{VERSION}] Warning: Invalid predictions for {model_name} for product {product_id} in {period} period")
+        print(f"[v{VERSION}] Warning: Invalid predictions for {model_name} for product {product_id}")
         return get_default_result(product_id, period)
     
-    # Copy and normalize dates
+    # Normalize dates
     predictions = predictions.copy()
     predictions['ds'] = pd.to_datetime(predictions['ds'], errors='coerce').dt.normalize()
     actuals = product_df[product_df['date'].between(start_date, end_date)][['date', 'quantity']].copy()
     actuals['date'] = pd.to_datetime(actuals['date'], errors='coerce').dt.normalize()
     
-    # Log data sizes and sample
+    # Log data
     print(f"[v{VERSION}] Product {product_id}: Actuals rows={len(actuals)}, Predictions rows={len(predictions)}")
     if not actuals.empty:
         print(f"[v{VERSION}] Product {product_id}: Actuals sample={actuals.head().to_dict()}")
@@ -432,9 +432,10 @@ def evaluate_model(product_df, predictions, start_date, end_date, model_name, ho
     
     # Check for NaN dates
     if predictions['ds'].isna().any() or actuals['date'].isna().any():
-        print(f"[v{VERSION}] Warning: NaN dates detected for product {product_id} in {period} period")
+        print(f"[v{VERSION}] Warning: NaN dates detected for product {product_id}")
         return get_default_result(product_id, period)
     
+    # Filter predictions for period
     period_predictions = predictions[predictions['ds'].between(start_date, end_date)].copy()
     
     metrics = {
@@ -449,42 +450,23 @@ def evaluate_model(product_df, predictions, start_date, end_date, model_name, ho
         print(f"[v{VERSION}] Product {product_id}: Merged rows={len(merged)}")
         
         if merged.empty:
-            print(f"[v{VERSION}] No matching data for {model_name} for product {product_id} in {period} period: "
-                  f"actuals rows={len(actuals)}, predictions rows={len(period_predictions)}")
-            metrics.update({
-                'RMSE': None,
-                'R2': None,
-                'MAE': None,
-                'SMAPE': None,
-                'Avg_Quantity_Real': 0.0
-            })
-        else:
-            # Check for required columns
-            if 'quantity' not in merged.columns or 'yhat' not in merged.columns:
-                print(f"[v{VERSION}] Missing 'quantity' or 'yhat' in merged DataFrame for product {product_id}")
-                metrics.update({
-                    'RMSE': None,
-                    'R2': None,
-                    'MAE': None,
-                    'SMAPE': None,
-                    'Avg_Quantity_Real': 0.0
-                })
-            else:
-                metrics.update({
-                    'RMSE': np.sqrt(mean_squared_error(merged['quantity'], merged['yhat'])),
-                    'R2': r2_score(merged['quantity'], merged['yhat']) if len(merged) > 1 else 0.0,
-                    'MAE': mean_absolute_error(merged['quantity'], merged['yhat']),
-                    'SMAPE': smape(merged['quantity'], merged['yhat']),
-                    'Avg_Quantity_Real': merged['quantity'].mean()
-                })
-    else:
+            print(f"[v{VERSION}] No matching data for {model_name} for product {product_id}")
+            return get_default_result(product_id, period)
+        
+        if 'quantity' not in merged.columns or 'yhat' not in merged.columns:
+            print(f"[v{VERSION}] Missing 'quantity' or 'yhat' in merged DataFrame for product {product_id}")
+            return get_default_result(product_id, period)
+        
         metrics.update({
-            'RMSE': None,
-            'R2': None,
-            'MAE': None,
-            'SMAPE': None,
-            'Avg_Quantity_Real': 0.0
+            'RMSE': np.sqrt(mean_squared_error(merged['quantity'], merged['yhat'])),
+            'R2': r2_score(merged['quantity'], merged['yhat']) if len(merged) > 1 else 0.0,
+            'MAE': mean_absolute_error(merged['quantity'], merged['yhat']),
+            'SMAPE': smape(merged['quantity'], merged['yhat']),
+            'Avg_Quantity_Real': merged['quantity'].mean()
         })
+    else:
+        print(f"[v{VERSION}] No actuals data for product {product_id} in {period} period")
+        return get_default_result(product_id, period)
     
     return metrics
     
@@ -596,12 +578,14 @@ def main():
     
     # Log holdout data availability
     print(f"[v{VERSION}] Checking holdout data availability for {args.holdout_days} days ({hold_out_start} to {hold_out_end})")
+    sparse_products = []
     for product in products:
         product_df = df[df['product_id'] == product]
         holdout_df = product_df[product_df['date'].between(hold_out_start, hold_out_end)]
         print(f"[v{VERSION}] Product {product}: {len(holdout_df)} rows in holdout period")
-        if len(holdout_df) < args.holdout_days:
+        if len(holdout_df) < args.holdout_days * 0.5:  # Flag if less than 50% coverage
             print(f"[v{VERSION}] Warning: Product {product} has sparse holdout data ({len(holdout_df)}/{args.holdout_days} days)")
+            sparse_products.append(product)
     
     last_update_file = os.path.join(OUTPUT_DIR, "last_update.txt")
     last_retrain_file = os.path.join(OUTPUT_DIR, "last_retrain.txt")
@@ -625,7 +609,6 @@ def main():
     weekly_predictions = []
     feature_insights = []
     high_smape_products = []
-    sparse_products = []
     
     for product in products:
         print(f"[v{VERSION}] Processing product: {product}")
@@ -702,10 +685,13 @@ def main():
                 predictions[name] = forecast
             models[name] = model
         
+        # Evaluate models only once per period
         model_weights = {}
         for name, pred in predictions.items():
+            if len(pred) != len(pd.date_range(start=hold_out_start, end=forecast_end, freq='D')):
+                print(f"[v{VERSION}] Warning: Predictions for {name} ({product}) have {len(pred)} rows, expected {len(pd.date_range(start=hold_out_start, end=forecast_end, freq='D'))}")
+                pred = pred[pred['ds'].between(hold_out_start, forecast_end)]
             metrics = evaluate_model(product_df, pred, hold_out_start, hold_out_end, name, hold_out_start)
-            #mape = metrics['MAPE'] if pd.notnull(metrics['MAPE']) else 100.0
             smape = metrics['SMAPE'] if pd.notnull(metrics['SMAPE']) else 100.0
             if smape > 100:
                 high_smape_products.append(product)
@@ -713,6 +699,7 @@ def main():
             results.append(metrics)
             results.append(evaluate_model(product_df, pred, forecast_start, forecast_end, name, hold_out_start))
         
+        # Ensemble predictions
         total_weight = sum(model_weights.values())
         model_weights = {k: v / total_weight if total_weight > 0 else 0.25 for k, v in model_weights.items()}
         ensemble_predictions = pd.DataFrame({
@@ -723,6 +710,7 @@ def main():
         results.append(evaluate_model(product_df, ensemble_predictions, hold_out_start, hold_out_end, 'Ensemble', hold_out_start))
         results.append(evaluate_model(product_df, ensemble_predictions, forecast_start, forecast_end, 'Ensemble', hold_out_start))
         
+        # Save predictions
         for model_name, pred in {**predictions, 'Ensemble': ensemble_predictions}.items():
             daily_predictions.extend(save_daily_predictions(
                 product, model_name, pred, product_df, hold_out_start, hold_out_end, forecast_start, forecast_end
@@ -735,6 +723,7 @@ def main():
         
         feature_insights.append(compute_feature_importance(models, FEATURES, product, timestamp))
     
+    # Save actuals for holdout period
     actual_predictions = []
     for product in products:
         product_df, _, _ = prepare_data(df, product, hold_out_start)
@@ -743,6 +732,7 @@ def main():
         holdout_actuals['date'] = pd.to_datetime(holdout_actuals['date']).dt.normalize()
         if holdout_actuals.empty:
             print(f"[v{VERSION}] No holdout actuals for product {product}")
+            results.append(get_default_result(product, 'Holdout'))
         for _, row in holdout_actuals.iterrows():
             key = (product, row['date'].strftime('%Y-%m-%d'), 'Actual', 'Holdout')
             if key not in [(d['product'], d['date'], d['model'], d['period']) for d in daily_predictions]:
@@ -756,6 +746,7 @@ def main():
                 })
     daily_predictions.extend(actual_predictions)
     
+    # Save outputs
     results_df = pd.DataFrame(results)
     results_df.to_csv(os.path.join(OUTPUT_DIR, f'model_comparison_{timestamp}.csv'), index=False)
     daily_df = pd.DataFrame(daily_predictions)
@@ -807,6 +798,8 @@ def main():
     if retrain_needed:
         with open(last_retrain_file, 'w') as f:
             f.write(start_time.strftime("%Y-%m-%d %H:%M:%S"))
+    
+    return results, template_vars['business_strategies']
 
 if __name__ == "__main__":
     try:

@@ -4,6 +4,9 @@ import json
 import os
 from datetime import datetime
 
+# insight_modules.py (top of file)
+from forecast_sales import VERSION  # Import VERSION
+
 def compute_feature_importance(models, features, product, timestamp):
     importance_dict = {'product': product, 'top_features': []}
     for model_name, model in models.items():
@@ -26,13 +29,13 @@ def compute_feature_importance(models, features, product, timestamp):
                 for feat, imp in feature_importance
             ])
         except Exception as e:
-            print(f"[v1.20.136] Error computing feature importance for {model_name} on {product}: {e}")
+            print(f"[v{VERSION}] Error computing feature importance for {model_name} on {product}: {e}")
     if not importance_dict['top_features']:
         importance_dict['top_features'] = [{'Feature': 'N/A', 'Importance': 0.0, 'Model': 'N/A'}]
     return importance_dict
 
 def clean_data_for_json(data):
-    #print(f"[v1.20.136] Cleaning data for JSON serialization, type: {type(data)}")
+    #print(f"[v{VERSION}] Cleaning data for JSON serialization, type: {type(data)}")
     if isinstance(data, list):
         return [clean_data_for_json(item) for item in data]
     elif isinstance(data, dict):
@@ -47,16 +50,17 @@ def clean_data_for_json(data):
         return None
     return data
 
-def get_default_result(product, period):
+def get_default_result(product_id, period):
+    print(f"[v{VERSION}] Skipping evaluation for {product_id}: No holdout actuals")
     return {
-        'Product': product,
+        'Product': product_id,
         'Model': 'N/A',
         'Period': period,
         'Avg_Quantity_Pred': 0.0,
-        'RMSE': None,
-        'R2': None,
-        'MAE': None,
-        'SMAPE': None,
+        'RMSE': 0.0,
+        'R2': 0.0,
+        'MAE': 0.0,
+        'SMAPE': 0.0,
         'Avg_Quantity_Real': 0.0
     }
 
@@ -65,10 +69,10 @@ def load_holidays():
         holidays = pd.read_csv('holidays.csv')
         holidays['ds'] = pd.to_datetime(holidays['ds'], errors='coerce')
         holidays = holidays.dropna(subset=['ds'])
-        print(f"[v1.20.136] Loading holidays from holidays.csv")
+        print(f"[v{VERSION}] Loading holidays from holidays.csv")
         return holidays
     except Exception as e:
-        print(f"[v1.20.136] Error loading holidays: {e}")
+        print(f"[v{VERSION}] Error loading holidays: {e}")
         return pd.DataFrame(columns=['ds', 'holiday'])
 
 def generate_alerts(high_mape_products, sparse_products):
@@ -135,20 +139,20 @@ def generate_interesting_fact(predictions, products, hold_out_start, hold_out_en
         product_preds = predictions_df[(predictions_df['product'] == product) & (predictions_df['period'] == 'Holdout') & (predictions_df['model'] != 'Actual')]
         product_actuals = predictions_df[(predictions_df['product'] == product) & (predictions_df['model'] == 'Actual') & (predictions_df['period'] == 'Holdout')]
         if product_preds.empty or product_actuals.empty:
-            print(f"[v1.20.136] Skipping product {product}: empty predictions ({len(product_preds)} rows) or actuals ({len(product_actuals)} rows)")
+            print(f"[v{VERSION}] Skipping product {product}: empty predictions ({len(product_preds)} rows) or actuals ({len(product_actuals)} rows)")
             sparse_products.append(product)
             continue
         if 'actual' not in product_actuals.columns:
-            print(f"[v1.20.136] No 'actual' column for product {product} in actuals, skipping")
+            print(f"[v{VERSION}] No 'actual' column for product {product} in actuals, skipping")
             sparse_products.append(product)
             continue
         merged = product_preds.merge(product_actuals[['date', 'actual']], on='date', how='inner')
         if merged.empty:
-            print(f"[v1.20.136] No matching data for product {product} after merge")
+            print(f"[v{VERSION}] No matching data for product {product} after merge")
             sparse_products.append(product)
             continue
         if 'predicted' not in merged.columns or 'actual' not in merged.columns:
-            print(f"[v1.20.136] Missing 'predicted' or 'actual' in merged DataFrame for product {product}")
+            print(f"[v{VERSION}] Missing 'predicted' or 'actual' in merged DataFrame for product {product}")
             sparse_products.append(product)
             continue
         diff = abs(merged['predicted'] - merged['actual']).mean()
@@ -164,7 +168,7 @@ def generate_summary_txt(timestamp, hold_out_start, hold_out_end, forecast_start
     summary = (
         f"Sales Forecast Summary\n"
         f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"Version: 1.20.136\n"
+        f"Version: [v{VERSION}]\n"
         f"Holdout Period: {hold_out_start.strftime('%Y-%m-%d')} to {hold_out_end.strftime('%Y-%m-%d')}\n"
         f"Forecast Period: {forecast_start.strftime('%Y-%m-%d')} to {forecast_end.strftime('%Y-%m-%d')}\n"
         f"Models Used: Prophet, XGBoost, LightGBM, CatBoost, Ensemble\n"
