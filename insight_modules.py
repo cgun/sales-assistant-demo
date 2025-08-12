@@ -87,15 +87,15 @@ def generate_business_strategies(results, products):
     for product in products:
         product_results = results_df[(results_df['Product'] == product) & (results_df['Period'] == 'Holdout')]
         if product_results.empty:
-            print(f"[v1.20.136] No holdout results for product {product}, skipping strategy generation")
+            print(f"[v{VERSION}] No holdout results for product {product}, skipping strategy generation")
             strategies.append({
                 'Product': product,
                 'Strategy': f"No sufficient data for {product}. Consider collecting more data or reviewing holdout period."
             })
             continue
-        smape_values = product_results['SMAPE']  # MAPE → SMAPE
+        smape_values = product_results['SMAPE']
         if smape_values.isna().all() or product_results.empty:
-            print(f"[v1.20.136] All SMAPE values are NaN for product {product}, using default strategy")
+            print(f"[v{VERSION}] All SMAPE values are NaN for product {product}, using default strategy")
             strategies.append({
                 'Product': product,
                 'Strategy': f"Insufficient holdout data for {product}. Defaulting to Prophet model for forecasting."
@@ -103,7 +103,7 @@ def generate_business_strategies(results, products):
             continue
         best_model_idx = smape_values.idxmin()
         if pd.isna(best_model_idx):
-            print(f"[v1.20.136] Unable to determine best model for product {product}, using default strategy")
+            print(f"[v{VERSION}] Unable to determine best model for product {product}, using default strategy")
             strategies.append({
                 'Product': product,
                 'Strategy': f"Unable to determine best model for {product} due to invalid SMAPE values. Defaulting to Prophet model."
@@ -111,11 +111,12 @@ def generate_business_strategies(results, products):
             continue
         best_model = product_results.loc[best_model_idx]
         avg_pred = product_results['Avg_Quantity_Pred'].mean()
+        avg_real = product_results['Avg_Quantity_Real'].mean()
         strategy = f"For product {product}, the best model is {best_model['Model']} with SMAPE {best_model['SMAPE']:.2f}%. "
-        if best_model['SMAPE'] > 50:
+        if pd.notna(best_model['SMAPE']) and best_model['SMAPE'] > 50:
             strategy += "High prediction error detected. Consider increasing stock buffer by 20% to account for uncertainty."
-        elif avg_pred > product_results['Avg_Quantity_Real'].mean() * 1.5:
-            strategy += f"Demand is forecasted to increase significantly ({avg_pred:.2f} vs {product_results['Avg_Quantity_Real'].mean():.2f}). Plan for additional inventory and promotional campaigns."
+        elif pd.notna(avg_pred) and pd.notna(avg_real) and avg_pred > avg_real * 1.5:
+            strategy += f"Demand is forecasted to increase significantly ({avg_pred:.2f} vs {avg_real:.2f}). Plan for additional inventory and promotional campaigns."
         else:
             strategy += f"Stable demand forecasted ({avg_pred:.2f}). Maintain current inventory levels and monitor closely."
         strategies.append({

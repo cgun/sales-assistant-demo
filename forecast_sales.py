@@ -406,21 +406,34 @@ def save_weekly_predictions(product, models, hold_out_start, hold_out_end, forec
 def smape(actual, predicted):
     return 100 * np.mean(2 * np.abs(predicted - actual) / (np.abs(actual) + np.abs(predicted) + 1e-10))
 
+
+
 def evaluate_model(product_df, predictions, start_date, end_date, model_name, hold_out_start):
     period = 'Holdout' if start_date == hold_out_start else 'Forecast'
     product_id = product_df['product_id'].iloc[0] if not product_df.empty else 'unknown'
     
+    # Validate predictions
     if predictions.empty or 'ds' not in predictions.columns or 'yhat' not in predictions.columns:
         print(f"[v{VERSION}] Warning: Invalid predictions for {model_name} for product {product_id} in {period} period")
         return get_default_result(product_id, period)
     
+    # Copy and normalize dates
     predictions = predictions.copy()
     predictions['ds'] = pd.to_datetime(predictions['ds'], errors='coerce').dt.normalize()
     actuals = product_df[product_df['date'].between(start_date, end_date)][['date', 'quantity']].copy()
     actuals['date'] = pd.to_datetime(actuals['date'], errors='coerce').dt.normalize()
     
-    # Log data sizes before merge
+    # Log data sizes and sample
     print(f"[v{VERSION}] Product {product_id}: Actuals rows={len(actuals)}, Predictions rows={len(predictions)}")
+    if not actuals.empty:
+        print(f"[v{VERSION}] Product {product_id}: Actuals sample={actuals.head().to_dict()}")
+    if not predictions.empty:
+        print(f"[v{VERSION}] Product {product_id}: Predictions sample={predictions.head().to_dict()}")
+    
+    # Check for NaN dates
+    if predictions['ds'].isna().any() or actuals['date'].isna().any():
+        print(f"[v{VERSION}] Warning: NaN dates detected for product {product_id} in {period} period")
+        return get_default_result(product_id, period)
     
     period_predictions = predictions[predictions['ds'].between(start_date, end_date)].copy()
     
@@ -433,6 +446,8 @@ def evaluate_model(product_df, predictions, start_date, end_date, model_name, ho
     
     if period == 'Holdout' and not actuals.empty:
         merged = period_predictions.merge(actuals, left_on='ds', right_on='date', how='inner')
+        print(f"[v{VERSION}] Product {product_id}: Merged rows={len(merged)}")
+        
         if merged.empty:
             print(f"[v{VERSION}] No matching data for {model_name} for product {product_id} in {period} period: "
                   f"actuals rows={len(actuals)}, predictions rows={len(period_predictions)}")
@@ -472,7 +487,7 @@ def evaluate_model(product_df, predictions, start_date, end_date, model_name, ho
         })
     
     return metrics
-
+    
 def generate_html_report(timestamp, template_vars):
     template_name = 'template.html'
     possible_dirs = [
