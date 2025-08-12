@@ -16,10 +16,10 @@ from sklearn.model_selection import RandomizedSearchCV
 import yaml
 import logging
 logging.getLogger('cmdstanpy').setLevel(logging.WARNING)
-from insight_modules import (compute_feature_importance, clean_data_for_json, 
-                            get_default_result, load_holidays, generate_alerts, 
-                            generate_business_strategies, generate_interesting_fact,
-                            format_df, generate_summary_txt)
+from insight_modules import (compute_feature_importance, clean_data_for_json, format_df,
+                            generate_alerts, load_holidays, 
+                            generate_business_strategies, generate_interesting_fact, 
+                            generate_summary_txt, get_default_result)
 
 def load_config():
     try:
@@ -27,8 +27,8 @@ def load_config():
             config = yaml.safe_load(file)
         return config
     except Exception as e:
-        print(f"[v1.20.136] Error loading config.yaml: {e}")
-        return {'version': '1.20.136'}
+        print(f"[v0.0.0] Error loading config.yaml: {e}")
+        return {'version': '0.0.0'}
 
 CONFIG = load_config()
 VERSION = CONFIG['version']

@@ -3,9 +3,19 @@ import numpy as np
 import json
 import os
 from datetime import datetime
+import yaml
 
-# insight_modules.py (top of file)
-from forecast_sales import VERSION  # Import VERSION
+def load_config():
+    try:
+        with open('config.yaml', 'r') as file:
+            config = yaml.safe_load(file)
+        return config
+    except Exception as e:
+        print(f"[v0.0.0] Error loading config.yaml: {e}")
+        return {'version': '0.0.0'}
+
+CONFIG = load_config()
+VERSION = CONFIG['version']
 
 def compute_feature_importance(models, features, product, timestamp):
     importance_dict = {'product': product, 'top_features': []}
