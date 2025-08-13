@@ -7,15 +7,16 @@ from catboost import CatBoostRegressor
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 from jinja2 import Environment, FileSystemLoader, TemplateError
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 import json
-import traceback
 import argparse
 import pickle
-from sklearn.model_selection import RandomizedSearchCV
-import yaml
+from sklearn.model_selection import ParameterGrid
 import logging
+import yaml
 logging.getLogger('cmdstanpy').setLevel(logging.WARNING)
+
+
 from insight_modules import (compute_feature_importance, clean_data_for_json, format_df,
                             generate_alerts, load_holidays, 
                             generate_business_strategies, generate_interesting_fact, 
@@ -39,7 +40,7 @@ PROPHET_REGRESSORS = CONFIG['features']['prophet_regressors']
 REQUIRED_COLUMNS = CONFIG['data']['required_columns']
 COLUMNS_TO_DROP = CONFIG['data']['columns_to_drop']
 HOLIDAY_COLUMNS = CONFIG['data']['holiday_columns']
-MODEL_PARAMS = CONFIG['model_params']
+
 ZERO_SALE_THRESHOLDS = CONFIG.get('features', {}).get('zero_sale_thresholds', {'campaign_intensity': 0.3, 'lag_1': 0.1})
 HOLDOUT_FEATURE_STRATEGY = CONFIG.get('features', {}).get('holdout_feature_strategy', 'static')
 
@@ -204,10 +205,101 @@ def prepare_future_features(future_df, i, last_quantity, recent_quantities, pred
         )
     return recent_quantities
 
-def train_prophet(product_df, hold_out_start, hold_out_end, forecast_start, forecast_end):
+def tune_model(model_type, product_df, hold_out_start, hold_out_end, forecast_start, forecast_end, config, force_retrain=False):
+    product = product_df['product_id'].iloc[0]
+    print(f"[v{VERSION}] Tuning {model_type} for product {product}")
+    cached_params = load_tuned_params(product, model_type)
+    if cached_params and not force_retrain:
+        print(f"[v{VERSION}] Loaded cached {model_type} parameters for {product}")
+        return cached_params
+    param_grid = config['model_params'].get(model_type.lower(), {})
+    if not param_grid:
+        print(f"[v{VERSION}] No tuning parameters for {model_type} in config, using defaults")
+        return {}
+    best_params = None
+    best_smape = float('inf')
+    train_df = product_df[product_df['date'] < hold_out_start]
+    val_df = product_df[product_df['date'].between(hold_out_start, hold_out_end)]
+    if train_df.empty or val_df.empty:
+        print(f"[v{VERSION}] Insufficient data for tuning {model_type} for {product}: train={len(train_df)}, val={len(val_df)}")
+        return {}
+    if model_type == 'Prophet':
+        for params in ParameterGrid(param_grid):
+            model = Prophet(
+                changepoint_prior_scale=params.get('changepoint_prior_scale', 0.05),
+                seasonality_prior_scale=params.get('seasonality_prior_scale', 10.0),
+                holidays_prior_scale=params.get('holidays_prior_scale', 10.0),
+                daily_seasonality=params.get('daily_seasonality', True),
+                weekly_seasonality=params.get('weekly_seasonality', True),
+                yearly_seasonality=params.get('yearly_seasonality', True)
+            )
+            holidays = load_holidays()
+            model.add_country_holidays(country_name='BR')
+            for feature in ['campaign_intensity', 'season', 'zero_sale_indicator']:
+                model.add_regressor(feature)
+            model.fit(train_df.rename(columns={'date': 'ds', 'quantity': 'y'}))
+            future_dates = pd.date_range(start=hold_out_start, end=hold_out_end, freq='D')
+            future_df = pd.DataFrame({'ds': future_dates})
+            future_df = future_df.merge(product_df[['date', 'campaign_intensity', 'season', 'zero_sale_indicator']].rename(columns={'date': 'ds'}), on='ds', how='left')
+            future_df.fillna(0, inplace=True)
+            forecast = model.predict(future_df)
+            merged = pd.merge(forecast, val_df[['date', 'quantity']].rename(columns={'date': 'ds', 'quantity': 'y'}), on='ds', how='left')
+            y_true = merged['y'].dropna()
+            y_pred = merged['yhat'][merged['y'].notnull()]
+            if len(y_true) >= 2:
+                smape_value = smape(y_true, y_pred)
+                if smape_value < best_smape:
+                    best_smape = smape_value
+                    best_params = params
+    else:
+        for params in ParameterGrid(param_grid):
+            if model_type == 'XGBoost':
+                model = XGBRegressor(**params, random_state=42)
+            elif model_type == 'LightGBM':
+                model = LGBMRegressor(**params, random_state=42)
+            else:
+                model = CatBoostRegressor(**params, random_state=42, verbose=False)
+            model.fit(train_df[FEATURES], train_df['quantity'])
+            future_dates = pd.date_range(start=hold_out_start, end=hold_out_end, freq='D')
+            future_df = pd.DataFrame({'ds': future_dates})
+            future_df = future_df.merge(product_df[['date'] + FEATURES].rename(columns={'date': 'ds'}), on='ds', how='left')
+            future_df.fillna(0, inplace=True)
+            last_quantity = train_df['quantity'].iloc[-1] if not train_df.empty else 0.0
+            recent_quantities = list(train_df['quantity'].tail(7)) if len(train_df) >= 7 else [0.0] * 7
+            predictions = []
+            for i in range(len(future_df)):
+                recent_quantities = prepare_future_features(future_df, i, last_quantity, recent_quantities, predictions)
+                pred = model.predict(future_df[FEATURES].iloc[[i]])[0]
+                pred = np.maximum(pred, 0)
+                predictions.append(pred)
+            smape_value = smape(val_df['quantity'], predictions[:len(val_df)])
+            if smape_value < best_smape:
+                best_smape = smape_value
+                best_params = params
+    if best_params is None:
+        print(f"[v{VERSION}] No valid parameters found for {model_type} for {product}, using defaults")
+        best_params = {}
+    save_tuned_params(product, model_type, best_params)
+    print(f"[v{VERSION}] Best parameters for {model_type} for {product}: {best_params}, SMAPE: {best_smape}")
+    return best_params
+
+def save_tuned_params(product, model_type, params):
+    file_path = os.path.join(OUTPUT_DIR, f'tuned_params_{product}_{model_type}.json')
+    with open(file_path, 'w') as f:
+        json.dump(params, f)
+    print(f"[v{VERSION}] Saved tuned parameters for {model_type} for {product} to {file_path}")
+
+def load_tuned_params(product, model_type):
+    file_path = os.path.join(OUTPUT_DIR, f'tuned_params_{product}_{model_type}.json')
+    if os.path.exists(file_path):
+        with open(file_path, 'r') as f:
+            return json.load(f)
+    return None
+    
+def train_prophet(product_df, hold_out_start, hold_out_end, forecast_start, forecast_end, config, force_retrain=False):
     product_id = product_df['product_id'].iloc[0] if not product_df.empty else 'unknown'
     print(f"[v{VERSION}] Training Prophet model for {product_id}")
-    train_df = product_df[product_df['date'] < hold_out_start][['date', 'quantity'] + PROPHET_REGRESSORS].copy()
+    train_df = product_df[product_df['date'] < hold_out_start][['date', 'quantity', 'campaign_intensity', 'season', 'zero_sale_indicator']].copy()
     train_df = train_df.rename(columns={'date': 'ds', 'quantity': 'y'})
     future_dates = pd.date_range(start=hold_out_start, end=forecast_end, freq='D')
     if len(train_df) < 2:
@@ -219,74 +311,37 @@ def train_prophet(product_df, hold_out_start, hold_out_end, forecast_start, fore
             'yhat_lower': [mean_quantity * 0.8] * len(future_dates),
             'yhat_upper': [mean_quantity * 1.2] * len(future_dates)
         })
-    model = Prophet(**MODEL_PARAMS['prophet'])
-    for col in PROPHET_REGRESSORS:
-        if col in train_df.columns:
-            model.add_regressor(col)
+    best_params = tune_model('Prophet', product_df, hold_out_start, hold_out_end, forecast_start, forecast_end, config, force_retrain) or {}
+    model = Prophet(
+        changepoint_prior_scale=best_params.get('changepoint_prior_scale', 0.05),
+        seasonality_prior_scale=best_params.get('seasonality_prior_scale', 10.0),
+        holidays_prior_scale=best_params.get('holidays_prior_scale', 10.0),
+        daily_seasonality=best_params.get('daily_seasonality', True),
+        weekly_seasonality=best_params.get('weekly_seasonality', True),
+        yearly_seasonality=best_params.get('yearly_seasonality', True)
+    )
+    holidays = load_holidays()
+    model.add_country_holidays(country_name='BR')
+    for feature in ['campaign_intensity', 'season', 'zero_sale_indicator']:
+        model.add_regressor(feature)
     model.fit(train_df)
     future_df = pd.DataFrame({'ds': future_dates})
-    future_df['campaign_intensity'] = 0.0
-    future_df['holiday'] = 0
-    future_df['season'] = 0
-    holdout_df = product_df[product_df['date'].between(hold_out_start, hold_out_end)][['date'] + PROPHET_REGRESSORS].rename(columns={'date': 'ds'})
-    future_df = future_df.merge(holdout_df, on='ds', how='left', suffixes=('', '_holdout'))
+    future_df = future_df.merge(product_df[['date', 'campaign_intensity', 'season', 'zero_sale_indicator']].rename(columns={'date': 'ds'}), on='ds', how='left')
     future_regressors = estimate_future_regressors(product_df, forecast_start, forecast_end)
     for i, row in future_df.iterrows():
         if row['ds'] >= forecast_start:
             idx = i - len(pd.date_range(hold_out_start, hold_out_end))
             if idx < len(future_regressors):
-                for col in ['campaign_intensity', 'holiday', 'season']:
+                for col in ['campaign_intensity', 'holiday', 'season', 'zero_sale_indicator']:
                     future_df.loc[i, col] = future_regressors[col].iloc[idx]
-    future_df['campaign_intensity'] = future_df['campaign_intensity'].fillna(0.0)
-    future_df['holiday'] = future_df['holiday'].fillna(0).astype(int)
-    future_df['season'] = future_df['season'].fillna(0)
-    last_train_quantity = train_df['y'].iloc[-1] if not train_df.empty else 0.0
-    recent_quantities = list(train_df['y'].tail(7)) if len(train_df) >= 7 else [0.0] * 7
-    predictions = []
-    for i in range(len(future_df)):
-        recent_quantities = prepare_future_features(future_df, i, last_train_quantity, recent_quantities, predictions)
-        batch_forecast = model.predict(future_df.iloc[[i]].copy())
-        pred = max(batch_forecast['yhat'].iloc[0], 0)
-        predictions.append(pred)
-    forecast = pd.DataFrame({
-        'ds': future_dates,
-        'yhat': predictions
-    })
+    future_df.fillna(0, inplace=True)
+    forecast = model.predict(future_df)
+    forecast['yhat'] = np.maximum(forecast['yhat'], 0)
     print(f"[v{VERSION}] Prophet forecast generated for {product_id}: {len(forecast)} rows")
-    return model, forecast
+    return model, forecast[['ds', 'yhat']]
 
-def train_tree_model(X_train, y_train, model_type='xgboost'):
-    if model_type == 'xgboost':
-        model = XGBRegressor(random_state=42)
-        param_dist = MODEL_PARAMS['xgboost']
-    elif model_type == 'lightgbm':
-        model = LGBMRegressor(random_state=42, verbosity=-1)
-        param_dist = MODEL_PARAMS['lightgbm']
-    elif model_type == 'catboost':
-        model = CatBoostRegressor(random_state=42, verbose=0)
-        param_dist = MODEL_PARAMS['catboost']
-    else:
-        raise ValueError(f"Unsupported model type: {model_type}")
-    n_samples = len(X_train)
-    if n_samples < 2:
-        return None, None
-    n_splits = min(3, n_samples)
-    if n_splits < 2:
-        model.fit(X_train, y_train)
-        return model, None
-    random_search = RandomizedSearchCV(
-        model,
-        param_distributions=param_dist,
-        n_iter=20,
-        scoring='neg_mean_squared_error',
-        cv=n_splits,
-        random_state=42,
-        n_jobs=-1
-    )
-    random_search.fit(X_train, y_train)
-    return random_search.best_estimator_, random_search.best_params_
 
-def train_tree(product_df, hold_out_start, hold_out_end, forecast_start, forecast_end, model_type):
+def train_tree(product_df, hold_out_start, hold_out_end, forecast_start, forecast_end, model_type, config, force_retrain=False):
     product_id = product_df['product_id'].iloc[0] if not product_df.empty else 'unknown'
     print(f"[v{VERSION}] Training {model_type.capitalize()} model for {product_id}")
     train_df = product_df[product_df['date'] < hold_out_start].copy()
@@ -297,30 +352,29 @@ def train_tree(product_df, hold_out_start, hold_out_end, forecast_start, forecas
             'ds': future_dates,
             'yhat': [0.0] * len(future_dates)
         })
-    X_train = train_df[FEATURES]
-    y_train = train_df['quantity']
-    model, _ = train_tree_model(X_train, y_train, model_type=model_type)
-    if model is None:
-        print(f"[v{VERSION}] {model_type.capitalize()} model training failed for product {product_id} due to insufficient data")
-        return None, pd.DataFrame({
-            'ds': future_dates,
-            'yhat': [0.0] * len(future_dates)
-        })
+    best_params = tune_model(model_type.capitalize(), product_df, hold_out_start, hold_out_end, forecast_start, forecast_end, config, force_retrain) or {}
+    if model_type == 'xgboost':
+        model = XGBRegressor(**best_params, random_state=42)
+    elif model_type == 'lightgbm':
+        model = LGBMRegressor(**best_params, random_state=42)
+    else:
+        model = CatBoostRegressor(**best_params, random_state=42, verbose=False)
+    model.fit(train_df[FEATURES], train_df['quantity'])
     future_df = pd.DataFrame({'ds': future_dates})
     future_df = future_df.merge(product_df[['date'] + FEATURES].rename(columns={'date': 'ds'}), on='ds', how='left')
     future_regressors = estimate_future_regressors(product_df, forecast_start, forecast_end)
     for i, row in future_df.iterrows():
         if row['ds'] >= forecast_start:
             idx = i - len(pd.date_range(hold_out_start, hold_out_end))
-            for col in ['campaign_intensity', 'holiday', 'season']:
-                if idx < len(future_regressors):
+            if idx < len(future_regressors):
+                for col in ['campaign_intensity', 'holiday', 'season', 'zero_sale_indicator']:
                     future_df.loc[i, col] = future_regressors[col].iloc[idx]
     future_df.fillna(0, inplace=True)
-    last_train_quantity = train_df['quantity'].iloc[-1] if not train_df.empty else 0.0
+    last_quantity = train_df['quantity'].iloc[-1] if not train_df.empty else 0.0
     recent_quantities = list(train_df['quantity'].tail(7)) if len(train_df) >= 7 else [0.0] * 7
     predictions = []
     for i in range(len(future_df)):
-        recent_quantities = prepare_future_features(future_df, i, last_train_quantity, recent_quantities, predictions)
+        recent_quantities = prepare_future_features(future_df, i, last_quantity, recent_quantities, predictions)
         pred = model.predict(future_df[FEATURES].iloc[[i]])[0]
         pred = np.maximum(pred, 0)
         predictions.append(pred)
@@ -636,6 +690,24 @@ def main():
     current_day = start_time.date()
     last_retrain_day = last_retrain.date()
     retrain_needed = args.force_retrain or (current_day - last_retrain_day).days >= 7
+    # Add historical actuals for all products
+    for product in products:
+        product_df = df[df['product_id'] == product]
+        historical_actuals = product_df[product_df['date'] < hold_out_start][['date', 'quantity']]
+        historical_actuals = historical_actuals.drop_duplicates(subset=['date'], keep='first')
+        historical_actuals['date'] = pd.to_datetime(historical_actuals['date']).dt.normalize()
+        if not historical_actuals.empty:
+            for _, row in historical_actuals.iterrows():
+                key = (product, row['date'].strftime('%Y-%m-%d'), 'Actual', 'Historical')
+                if key not in [(d['product'], d['date'], d['model'], d['period']) for d in daily_predictions]:
+                    daily_predictions.append({
+                        'product': product,
+                        'date': row['date'].strftime('%Y-%m-%d'),
+                        'model': 'Actual',
+                        'period': 'Historical',
+                        'actual': float(row['quantity']),
+                        'predicted': None
+                    })
     for product in products:
         product_df = df[df['product_id'] == product]
         holdout_df = product_df[product_df['date'].between(hold_out_start, hold_out_end)]
@@ -722,12 +794,14 @@ def main():
                     print(f"[v{VERSION}] Loaded {name} model for {product}")
                 except Exception as e:
                     print(f"[v{VERSION}] Error loading {name} model: {e}, retraining...")
+
+            # Inside the non-sparse product loop
             if model is None or retrain_needed:
                 print(f"[v{VERSION}] Training {name} model for {product}")
                 if name == 'Prophet':
-                    model, forecast = train_prophet(product_df, hold_out_start, hold_out_end, forecast_start, forecast_end)
+                    model, forecast = train_prophet(product_df, hold_out_start, hold_out_end, forecast_start, forecast_end, config, retrain_needed)
                 else:
-                    model, forecast = train_tree(product_df, hold_out_start, hold_out_end, forecast_start, forecast_end, model_type=name.lower())
+                    model, forecast = train_tree(product_df, hold_out_start, hold_out_end, forecast_start, forecast_end, model_type=name.lower(), config=config, force_retrain=retrain_needed)
                 if model is not None:
                     pickle.dump(model, open(model_path, 'wb'))
                     print(f"[v{VERSION}] Saved {name} model for {product}")
@@ -737,8 +811,12 @@ def main():
                 future_df = pd.DataFrame({'ds': future_dates})
                 future_df = future_df.merge(product_df[['date'] + FEATURES].rename(columns={'date': 'ds'}), on='ds', how='left')
                 future_regressors = estimate_future_regressors(product_df, forecast_start, forecast_end)
-                for i, row in future_df.iterrows():
-                    if row['ds'] >= forecast_start:
+                last_quantity = product_df[product_df['date'] < hold_out_start]['quantity'].iloc[-1] if not product_df[product_df['date'] < hold_out_start].empty else 0.0
+                recent_quantities = list(product_df[product_df['date'] < hold_out_start]['quantity'].tail(7)) if len(product_df[product_df['date'] < hold_out_start]) >= 7 else [0.0] * 7
+                predictions = []
+                for i in range(len(future_df)):
+                    recent_quantities = prepare_future_features(future_df, i, last_quantity, recent_quantities, predictions)
+                    if i >= len(pd.date_range(hold_out_start, hold_out_end)):
                         idx = i - len(pd.date_range(hold_out_start, hold_out_end))
                         if idx < len(future_regressors):
                             for col in ['campaign_intensity', 'holiday', 'season', 'zero_sale_indicator']:
@@ -753,6 +831,7 @@ def main():
                     pred = np.maximum(pred, 0)
                     forecast = pd.DataFrame({'ds': future_dates, 'yhat': pred})
                 predictions[name] = forecast
+
             models[name] = model
         df_actuals = product_df[product_df['date'].between(hold_out_start, hold_out_end)][['product_id', 'date', 'quantity']].rename(columns={'date': 'ds', 'quantity': 'y'})
         print(f"[v{VERSION}] df_actuals for {product}: columns={df_actuals.columns}, rows={len(df_actuals)}, head={df_actuals.head()}")

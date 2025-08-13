@@ -1,9 +1,9 @@
-version: 1.20.136
+version: 1.20.137
 input_file: textile_sales_data_synthetic_br.csv
 output_dir: outputs
 features:
   tree_features: ['holiday', 'campaign_intensity', 'season', 'lag_1', 'lag_7', 'rolling_mean_7', 'rolling_std_7', 'lag_1_missing', 'lag_7_missing', 'zero_sale_indicator']
-  prophet_regressors: ['holiday', 'campaign_intensity', 'season']
+  prophet_regressors: ['holiday', 'campaign_intensity', 'season', 'zero_sale_indicator']
   display_features: ['holiday', 'campaign_intensity', 'season', 'lag_1', 'lag_7']
   zero_sale_thresholds:
     campaign_intensity: 0.3
@@ -14,22 +14,28 @@ data:
   columns_to_drop: []
   holiday_columns: ['ds', 'holiday']
 periods:
-  holdout_days: 90  
+  holdout_days: 90
   forecast_days: 30
 model_params:
   prophet:
-    yearly_seasonality: true
-    weekly_seasonality: true
-    daily_seasonality: true
+    changepoint_prior_scale: [0.01, 0.05, 0.1, 0.5]
+    seasonality_prior_scale: [0.1, 1.0, 10.0, 100.0]
+    holidays_prior_scale: [0.1, 1.0, 10.0, 100.0]
+    yearly_seasonality: [true]
+    weekly_seasonality: [true]
+    daily_seasonality: [true]
   xgboost:
     n_estimators: [50, 100, 200]
     max_depth: [3, 5, 7]
     learning_rate: [0.01, 0.1, 0.3]
+    subsample: [0.6, 0.8, 1.0]
   lightgbm:
     n_estimators: [50, 100, 200]
     max_depth: [3, 5, 7]
     learning_rate: [0.01, 0.1, 0.3]
+    subsample: [0.6, 0.8, 1.0]
   catboost:
-    iterations: [50, 100, 200]
+    n_estimators: [50, 100, 200]
     depth: [4, 6, 8]
     learning_rate: [0.01, 0.1, 0.3]
+    l2_leaf_reg: [1, 3, 5, 10]
