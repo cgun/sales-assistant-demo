@@ -19,6 +19,8 @@ VERSION = CONFIG['version']
 
 def compute_feature_importance(models, features, product, timestamp):
     importance_dict = {'product': product, 'top_features': []}
+    feature_imp_dict = {}  # Aggregate importance per feature
+    num_valid_models = 0
     for model_name, model in models.items():
         if model_name == 'Prophet' or model is None:
             continue
@@ -29,23 +31,29 @@ def compute_feature_importance(models, features, product, timestamp):
                 importance = model.get_feature_importance()
             else:
                 continue
-            feature_importance = sorted(
-                zip(features, importance),
-                key=lambda x: x[1],
-                reverse=True
-            )[:5]
-            importance_dict['top_features'].extend([
-                {'Feature': feat, 'Importance': float(imp), 'Model': model_name}
-                for feat, imp in feature_importance
-            ])
+            # Normalize importance to sum to 1 for this model
+            importance_sum = sum(importance) if sum(importance) > 0 else 1.0
+            importance = [imp / importance_sum for imp in importance]
+            for feat, imp in zip(features, importance):
+                feature_imp_dict[feat] = feature_imp_dict.get(feat, 0) + imp
+            num_valid_models += 1
         except Exception as e:
             print(f"[v{VERSION}] Error computing feature importance for {model_name} on {product}: {e}")
+    if feature_imp_dict and num_valid_models > 0:
+        # Average across models and normalize to 1.0
+        feature_importance = [(feat, imp / num_valid_models) for feat, imp in feature_imp_dict.items()]
+        total_imp = sum(imp for _, imp in feature_importance)
+        if total_imp > 0:
+            feature_importance = [(feat, imp / total_imp) for feat, imp in feature_importance]
+        feature_importance = sorted(feature_importance, key=lambda x: x[1], reverse=True)[:5]
+        importance_dict['top_features'] = [
+            {'Feature': feat, 'Importance': float(imp)} for feat, imp in feature_importance
+        ]
     if not importance_dict['top_features']:
-        importance_dict['top_features'] = [{'Feature': 'N/A', 'Importance': 0.0, 'Model': 'N/A'}]
+        importance_dict['top_features'] = [{'Feature': 'N/A', 'Importance': 0.0}]
     return importance_dict
 
 def clean_data_for_json(data):
-    #print(f"[v{VERSION}] Cleaning data for JSON serialization, type: {type(data)}")
     if isinstance(data, list):
         return [clean_data_for_json(item) for item in data]
     elif isinstance(data, dict):
@@ -95,10 +103,19 @@ def generate_alerts(high_mape_products, sparse_products):
         alerts.append("No significant issues detected in the forecasting process.")
     return alerts
 
-def generate_business_strategies(results, products):
+def generate_business_strategies(results, products, sparse_products=None):
+    if sparse_products is None:
+        sparse_products = []
     strategies = []
     results_df = pd.DataFrame(results)
     for product in products:
+        if product in sparse_products:
+            print(f"[v{VERSION}] Skipping strategy generation for sparse product {product}")
+            strategies.append({
+                'Product': product,
+                'Strategy': f"No sufficient data for {product}. Consider collecting more data or reviewing holdout period."
+            })
+            continue
         product_results = results_df[(results_df['Product'] == product) & (results_df['Period'] == 'Holdout')]
         if product_results.empty:
             print(f"[v{VERSION}] No holdout results for product {product}, skipping strategy generation")
@@ -138,31 +155,40 @@ def generate_business_strategies(results, products):
             'Strategy': strategy
         })
     return strategies
-    
 
 def generate_interesting_fact(predictions, products, hold_out_start, hold_out_end):
     predictions_df = pd.DataFrame(predictions)
     max_diff_product = None
     max_diff = 0
     sparse_products = []
+    expected_rows = len(pd.date_range(start=hold_out_start, end=hold_out_end, freq='D'))
     for product in products:
-        product_preds = predictions_df[(predictions_df['product'] == product) & (predictions_df['period'] == 'Holdout') & (predictions_df['model'] != 'Actual')]
-        product_actuals = predictions_df[(predictions_df['product'] == product) & (predictions_df['model'] == 'Actual') & (predictions_df['period'] == 'Holdout')]
+        product_preds = predictions_df[
+            (predictions_df['product'] == product) &
+            (predictions_df['period'] == 'Holdout') &
+            (predictions_df['model'] == 'Ensemble')
+        ]
+        product_actuals = predictions_df[
+            (predictions_df['product'] == product) &
+            (predictions_df['model'] == 'Actual') &
+            (predictions_df['period'] == 'Holdout')
+        ]
         if product_preds.empty or product_actuals.empty:
             print(f"[v{VERSION}] Skipping product {product}: empty predictions ({len(product_preds)} rows) or actuals ({len(product_actuals)} rows)")
             sparse_products.append(product)
             continue
         if 'actual' not in product_actuals.columns:
-            print(f"[v{VERSION}] No 'actual' column for product {product} in actuals, skipping")
+            print(f"[v{VERSION}] No 'actual' column for product {product} in actuals, columns={list(product_actuals.columns)}")
             sparse_products.append(product)
             continue
-        merged = product_preds.merge(product_actuals[['date', 'actual']], on='date', how='inner')
+        merged = pd.merge(
+            product_preds[['date', 'predicted']],
+            product_actuals[['date', 'actual']],
+            on='date',
+            how='inner'
+        )
         if merged.empty:
-            print(f"[v{VERSION}] No matching data for product {product} after merge")
-            sparse_products.append(product)
-            continue
-        if 'predicted' not in merged.columns or 'actual' not in merged.columns:
-            print(f"[v{VERSION}] Missing 'predicted' or 'actual' in merged DataFrame for product {product}")
+            print(f"[v{VERSION}] No matching dates for product {product} after merge")
             sparse_products.append(product)
             continue
         diff = abs(merged['predicted'] - merged['actual']).mean()
@@ -192,18 +218,33 @@ def generate_summary_txt(timestamp, hold_out_start, hold_out_end, forecast_start
     os.makedirs('outputs', exist_ok=True)
     with open(f'outputs/summary_{timestamp}.txt', 'w') as f:
         f.write(summary)
-    print(f"[v1.20.136] Generated summary: outputs/summary_{timestamp}.txt")
+    print(f"[v{VERSION}] Generated summary: outputs/summary_{timestamp}.txt")
     return summary
 
 def format_df(df, period):
     if df.empty:
         return "<p>No data available for this period.</p>"
     df = df.copy()
-    for col in ['Avg_Quantity_Pred', 'Avg_Quantity_Real', 'RMSE', 'MAE', 'MAPE', 'R2']:
+    # Standardize metric columns to uppercase
+    if 'smape' in df.columns:
+        df['SMAPE'] = df['smape']
+        df = df.drop(columns=['smape'])
+    if 'rmse' in df.columns:
+        df['RMSE'] = df['rmse']
+        df = df.drop(columns=['rmse'])
+    if 'r2' in df.columns:
+        df['R2'] = df['r2']
+        df = df.drop(columns=['r2'])
+    if 'mae' in df.columns:
+        df['MAE'] = df['mae']
+        df = df.drop(columns=['mae'])
+    for col in ['Avg_Quantity_Pred', 'Avg_Quantity_Real', 'RMSE', 'R2', 'MAE', 'SMAPE']:
         if col in df.columns:
             df[col] = df[col].apply(lambda x: f"{x:.2f}" if pd.notnull(x) else 'N/A')
-    if period == 'forecast':
-        df = df[['Product', 'Model', 'Avg_Quantity_Pred']]
+    if period == 'holdout':
+        df = df[['Product', 'Model', 'Period', 'Avg_Quantity_Pred', 'Avg_Quantity_Real', 'RMSE', 'R2', 'MAE', 'SMAPE']]
+    elif period == 'forecast':
+        df = df[['Product', 'Model', 'Period', 'Avg_Quantity_Pred']]
     html = "<table class='table-auto w-full border-collapse border border-gray-300'>\n<thead>\n<tr>"
     for col in df.columns:
         html += f"<th class='border border-gray-300 px-4 py-2'>{col}</th>"

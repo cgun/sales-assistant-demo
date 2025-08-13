@@ -128,17 +128,34 @@ def prepare_data(df, product, hold_out_start):
 
 def estimate_future_regressors(df, forecast_start, forecast_end):
     if df.empty:
+        print(f"[v{VERSION}] No data for future regressors, using defaults")
         future_dates = pd.date_range(start=forecast_start, end=forecast_end, freq='D')
         return pd.DataFrame({
             'ds': future_dates,
             'campaign_intensity': [0.0] * len(future_dates),
             'holiday': [0] * len(future_dates),
-            'season': [0] * len(future_dates)
+            'season': [0] * len(future_dates),
+            'zero_sale_indicator': [0] * len(future_dates)
         })
     df_last_year = df[df['date'] >= df['date'].max() - pd.Timedelta(days=365)].copy()
+    if df_last_year.empty:
+        print(f"[v{VERSION}] No historical data for future regressors, using defaults")
+        future_dates = pd.date_range(start=forecast_start, end=forecast_end, freq='D')
+        return pd.DataFrame({
+            'ds': future_dates,
+            'campaign_intensity': [0.0] * len(future_dates),
+            'holiday': [0] * len(future_dates),
+            'season': [0] * len(future_dates),
+            'zero_sale_indicator': [0] * len(future_dates)
+        })
     df_last_year['month_day'] = df_last_year['date'].dt.strftime('%m-%d')
     campaign_avg = df_last_year.groupby('month_day')['campaign_intensity'].mean().reset_index()
     season_map = df_last_year.groupby('month_day')['season'].first().reset_index()
+    # Calculate zero_sale_indicator for historical data
+    df_last_year['zero_sale_indicator'] = df_last_year.apply(
+        lambda row: set_zero_sale_indicator(row.get('holiday', 0), row['campaign_intensity'], row['quantity']), axis=1
+    )
+    zero_sale_avg = df_last_year.groupby('month_day')['zero_sale_indicator'].mean().reset_index()
     holidays = load_holidays()
     holidays = holidays[['ds', 'holiday']]
     holidays['ds'] = pd.to_datetime(holidays['ds'], errors='coerce')
@@ -153,10 +170,15 @@ def estimate_future_regressors(df, forecast_start, forecast_end):
     future_df = future_df.merge(campaign_avg, on='month_day', how='left')
     future_df = future_df.merge(holiday_avg, on='month_day', how='left')
     future_df = future_df.merge(season_map, on='month_day', how='left')
-    future_df['campaign_intensity'] = future_df['campaign_intensity'].fillna(df_last_year['campaign_intensity'].mean() if not df_last_year.empty else 0.0)
+    future_df = future_df.merge(zero_sale_avg, on='month_day', how='left')
+    # Use overall historical averages if merge fails
+    future_df['campaign_intensity'] = future_df['campaign_intensity'].fillna(df['campaign_intensity'].mean() if not df['campaign_intensity'].isna().all() else 0.0)
     future_df['holiday'] = future_df['holiday'].fillna(0).astype(int)
-    future_df['season'] = future_df['season'].fillna(df_last_year['season'].mode()[0] if not df_last_year.empty and not df_last_year['season'].mode().empty else 0)
-    return future_df[['ds', 'campaign_intensity', 'holiday', 'season']]
+    future_df['season'] = future_df['season'].fillna(df['season'].mode()[0] if not df['season'].isna().all() and not df['season'].mode().empty else 0)
+    future_df['zero_sale_indicator'] = future_df['zero_sale_indicator'].fillna(df_last_year['zero_sale_indicator'].mean() if not df_last_year.empty else 0)
+    if future_df[['campaign_intensity', 'holiday', 'season', 'zero_sale_indicator']].isna().all().any():
+        print(f"[v{VERSION}] Some regressors missing for forecast period, using historical averages")
+    return future_df[['ds', 'campaign_intensity', 'holiday', 'season', 'zero_sale_indicator']]
 
 def prepare_future_features(future_df, i, last_quantity, recent_quantities, predictions=None):
     if i == 0:
@@ -309,10 +331,13 @@ def train_tree(product_df, hold_out_start, hold_out_end, forecast_start, forecas
     print(f"[v{VERSION}] {model_type.capitalize()} forecast generated for {product_id}: {len(forecast)} rows")
     return model, forecast
 
-def save_daily_predictions(product, model_name, predictions, product_df, hold_out_start, hold_out_end, forecast_start, forecast_end):
+def save_daily_predictions(product, model_name, predictions, product_df, hold_out_start, hold_out_end, forecast_start, forecast_end, sparse_products=None):
+    if sparse_products is None:
+        sparse_products = []
     daily_data = []
-    if predictions.empty or 'ds' not in predictions.columns or 'yhat' not in predictions.columns:
-        print(f"[v{VERSION}] Warning: Empty or invalid predictions for {model_name} for product {product}")
+    expected_rows = len(pd.date_range(start=hold_out_start, end=forecast_end, freq='D'))
+    if predictions.empty or 'ds' not in predictions.columns or 'yhat' not in predictions.columns or len(predictions) != expected_rows:
+        print(f"[v{VERSION}] Warning: Invalid predictions for {model_name} ({product}): {len(predictions)} rows, expected {expected_rows}")
         future_dates = pd.date_range(start=hold_out_start, end=forecast_end, freq='D')
         predictions = pd.DataFrame({
             'ds': future_dates,
@@ -327,15 +352,26 @@ def save_daily_predictions(product, model_name, predictions, product_df, hold_ou
         lambda x: 'Holdout' if hold_out_start <= x <= hold_out_end else 'Forecast'
     )
     holdout_regressors = product_df[product_df['date'].between(hold_out_start, hold_out_end)][['date', 'zero_sale_indicator']].rename(columns={'date': 'ds'})
-    if holdout_regressors.empty or 'zero_sale_indicator' not in holdout_regressors.columns:
-        holdout_regressors = pd.DataFrame({'ds': predictions['ds'].unique(), 'zero_sale_indicator': 0})
+    if holdout_regressors.empty or 'zero_sale_indicator' not in product_df.columns:
+        print(f"[v{VERSION}] No holdout regressors for {product}, calculating from data")
+        holdout_df = product_df[product_df['date'].between(hold_out_start, hold_out_end)].copy()
+        holdout_df['zero_sale_indicator'] = holdout_df.apply(
+            lambda row: set_zero_sale_indicator(row.get('holiday', 0), row['campaign_intensity'], row['quantity']), axis=1
+        )
+        holdout_regressors = holdout_df[['date', 'zero_sale_indicator']].rename(columns={'date': 'ds'})
+        if holdout_regressors.empty:
+            holdout_regressors = pd.DataFrame({'ds': pd.date_range(start=hold_out_start, end=hold_out_end, freq='D'), 'zero_sale_indicator': 0})
     holdout_regressors = holdout_regressors.drop_duplicates(subset=['ds'], keep='first')
-    future_regressors = product_df[product_df['date'] >= hold_out_end][['date', 'zero_sale_indicator']].rename(columns={'date': 'ds'})
-    if future_regressors.empty:
-        future_regressors = pd.DataFrame({'ds': predictions[predictions['ds'] >= forecast_start]['ds'].unique(), 'zero_sale_indicator': 0})
+    future_regressors = estimate_future_regressors(product_df, forecast_start, forecast_end)
+    if future_regressors.empty or 'zero_sale_indicator' not in future_regressors.columns:
+        print(f"[v{VERSION}] No future regressors for {product}, using default")
+        future_regressors = pd.DataFrame({
+            'ds': pd.date_range(start=forecast_start, end=forecast_end, freq='D'),
+            'zero_sale_indicator': [0] * len(pd.date_range(start=forecast_start, end=forecast_end, freq='D'))
+        })
     future_regressors = future_regressors.drop_duplicates(subset=['ds'], keep='first')
     predictions = predictions.merge(holdout_regressors, on='ds', how='left', suffixes=('', '_holdout'))
-    predictions = predictions.merge(future_regressors, on='ds', how='left', suffixes=('', '_forecast'))
+    predictions = predictions.merge(future_regressors[['ds', 'zero_sale_indicator']], on='ds', how='left', suffixes=('', '_forecast'))
     predictions['zero_sale_indicator'] = predictions['zero_sale_indicator'].fillna(
         predictions['zero_sale_indicator_forecast'].fillna(0)
     )
@@ -346,29 +382,44 @@ def save_daily_predictions(product, model_name, predictions, product_df, hold_ou
     )
     predictions['yhat'] = np.where(predictions['yhat'] < 0.1, 0, predictions['yhat'])
     holdout_actuals = product_df[product_df['date'].between(hold_out_start, hold_out_end)][['date', 'quantity']]
-    holdout_actuals = holdout_actuals.drop_duplicates(subset=['date'], keep='first')
-    holdout_actuals = holdout_actuals.rename(columns={'date': 'ds', 'quantity': 'actual'})
-    holdout_actuals['ds'] = pd.to_datetime(holdout_actuals['ds'])
-    predictions = predictions.merge(holdout_actuals, on='ds', how='left')
-    if holdout_actuals.empty:
-        print(f"[v{VERSION}] No actuals data for product {product} in holdout period")
+    if holdout_actuals.empty or 'quantity' not in product_df.columns:
+        print(f"[v{VERSION}] No holdout actuals for {product}, creating default")
+        holdout_actuals = pd.DataFrame({
+            'ds': pd.date_range(start=hold_out_start, end=hold_out_end, freq='D'),
+            'actual': [0.0] * len(pd.date_range(start=hold_out_start, end=hold_out_end))
+        })
+    else:
+        holdout_actuals = holdout_actuals.rename(columns={'date': 'ds', 'quantity': 'actual'})
+        holdout_actuals = holdout_actuals.drop_duplicates(subset=['ds'], keep='first')
+        holdout_actuals['ds'] = pd.to_datetime(holdout_actuals['ds'])
+    predictions = predictions.merge(holdout_actuals[['ds', 'actual']], on='ds', how='left')
     seen = set()
     for _, row in predictions.iterrows():
         key = (row['Product'], row['Date'], row['Model'], row['Period'])
-        if key not in seen:
-            actual_value = float(row['actual']) if pd.notnull(row['actual']) else None
-            if row['Model'] == 'Actual' and actual_value is None:
-                print(f"[v{VERSION}] Missing actual value for product {product}, date {row['Date']}")
-                continue
+        if key not in seen and row['Model'] != 'Actual':
             daily_data.append({
                 'product': row['Product'],
                 'date': row['Date'],
                 'model': row['Model'],
                 'period': row['Period'],
-                'actual': actual_value,
+                'actual': float(row['actual']) if pd.notnull(row['actual']) else None,
                 'predicted': float(row['yhat'])
             })
             seen.add(key)
+    # Skip 'Actual' data for sparse products, handle in main
+    if product not in sparse_products and not holdout_actuals.empty:
+        for _, row in holdout_actuals.iterrows():
+            key = (product, row['ds'].strftime('%Y-%m-%d'), 'Actual', 'Holdout')
+            if key not in seen:
+                daily_data.append({
+                    'product': product,
+                    'date': row['ds'].strftime('%Y-%m-%d'),
+                    'model': 'Actual',
+                    'period': 'Holdout',
+                    'actual': float(row['actual']),
+                    'predicted': None
+                })
+                seen.add(key)
     return daily_data
 
 def save_weekly_predictions(product, models, hold_out_start, hold_out_end, forecast_start, forecast_end):
@@ -406,70 +457,60 @@ def save_weekly_predictions(product, models, hold_out_start, hold_out_end, forec
 def smape(actual, predicted):
     return 100 * np.mean(2 * np.abs(predicted - actual) / (np.abs(actual) + np.abs(predicted) + 1e-10))
 
-
-
-def evaluate_model(product_df, predictions, start_date, end_date, model_name, hold_out_start):
-    period = 'Holdout' if start_date == hold_out_start else 'Forecast'
-    product_id = product_df['product_id'].iloc[0] if not product_df.empty else 'unknown'
-    
-    # Validate inputs
-    if predictions.empty or 'ds' not in predictions.columns or 'yhat' not in predictions.columns:
-        print(f"[v{VERSION}] Warning: Invalid predictions for {model_name} for product {product_id}")
-        return get_default_result(product_id, period)
-    
-    # Normalize dates
-    predictions = predictions.copy()
-    predictions['ds'] = pd.to_datetime(predictions['ds'], errors='coerce').dt.normalize()
-    actuals = product_df[product_df['date'].between(start_date, end_date)][['date', 'quantity']].copy()
-    actuals['date'] = pd.to_datetime(actuals['date'], errors='coerce').dt.normalize()
-    
-    # Log data
-    print(f"[v{VERSION}] Product {product_id}: Actuals rows={len(actuals)}, Predictions rows={len(predictions)}")
-    if not actuals.empty:
-        print(f"[v{VERSION}] Product {product_id}: Actuals sample={actuals.head().to_dict()}")
-    if not predictions.empty:
-        print(f"[v{VERSION}] Product {product_id}: Predictions sample={predictions.head().to_dict()}")
-    
-    # Check for NaN dates
-    if predictions['ds'].isna().any() or actuals['date'].isna().any():
-        print(f"[v{VERSION}] Warning: NaN dates detected for product {product_id}")
-        return get_default_result(product_id, period)
-    
-    # Filter predictions for period
-    period_predictions = predictions[predictions['ds'].between(start_date, end_date)].copy()
-    
+def evaluate_model(predictions_df, df_actuals, product_id, model_name, hold_out_start, hold_out_end, forecast_start, forecast_end):
+    print(f"[v{VERSION}] Evaluating {model_name} for product {product_id}")
+    if 'ds' not in predictions_df.columns or 'yhat' not in predictions_df.columns:
+        print(f"[v{VERSION}] Missing required columns in predictions_df for {product_id}: {predictions_df.columns}")
+        return None
+    print(f"[v{VERSION}] Product {product_id}: Actuals rows={len(df_actuals)}, Predictions rows={len(predictions_df)}")
+    if not df_actuals.empty:
+        print(f"[v{VERSION}] Product {product_id}: Actuals sample (1 row)={df_actuals.head(1).to_dict()}")
+        print(f"[v{VERSION}] Product {product_id}: Predictions sample (1 row)={predictions_df.head(1).to_dict()}")
+    df_actuals_product = df_actuals[df_actuals['product_id'] == product_id][['ds', 'y']].copy()
+    if df_actuals_product.empty:
+        print(f"[v{VERSION}] No actuals data for product {product_id} in holdout period")
+        return None
+    merged = pd.merge(
+        predictions_df,
+        df_actuals_product,
+        how='left',
+        on='ds',
+        validate='one_to_one'
+    )
+    merged.rename(columns={'y': 'actual'}, inplace=True)
+    print(f"[v{VERSION}] Product {product_id}: Merged rows={len(merged)}, Actuals non-null={merged['actual'].notnull().sum()}")
+    if 'actual' not in merged.columns or merged['actual'].isna().all():
+        print(f"[v{VERSION}] No 'actual' column or all actuals are null for {product_id} after merge. Actuals head: {df_actuals_product.head()}")
+        return None
+    evaluation_data = merged[merged['actual'].notnull()].copy()
+    if evaluation_data.empty:
+        print(f"[v{VERSION}] No non-null actuals data for {product_id} in evaluation period")
+        return None
+    holdout_predictions = predictions_df[predictions_df['ds'].between(hold_out_start, hold_out_end)]
+    forecast_predictions = predictions_df[predictions_df['ds'] >= forecast_start]
+    print(f"[v{VERSION}] Product {product_id}: Holdout prediction dates={holdout_predictions['ds'].min()} to {holdout_predictions['ds'].max()}")
+    print(f"[v{VERSION}] Product {product_id}: Forecast prediction dates={forecast_predictions['ds'].min()} to {forecast_predictions['ds'].max()}")
+    print(f"[v{VERSION}] Product {product_id}: Actuals dates={df_actuals_product['ds'].min()} to {df_actuals_product['ds'].max()}")
+    y_true = evaluation_data['actual']
+    y_pred = evaluation_data['yhat']
+    if len(y_true) < 2 or np.var(y_true) == 0 or np.var(y_pred) == 0:
+        print(f"[v{VERSION}] Insufficient variance or data points for {product_id} ({model_name})")
+        return {
+            'RMSE': 0.0,
+            'R2': 0.0,
+            'MAE': mean_absolute_error(y_true, y_pred) if len(y_true) >= 1 else 0.0,
+            'SMAPE': smape(y_true, y_pred) if len(y_true) >= 1 else 0.0
+        }
+    smape_value = smape(y_true, y_pred)
     metrics = {
-        'Product': product_id,
-        'Model': model_name,
-        'Period': period,
-        'Avg_Quantity_Pred': period_predictions['yhat'].mean() if not period_predictions.empty else 0.0
+        'RMSE': np.sqrt(mean_squared_error(y_true, y_pred)),
+        'R2': r2_score(y_true, y_pred),
+        'MAE': mean_absolute_error(y_true, y_pred),
+        'SMAPE': smape_value
     }
-    
-    if period == 'Holdout' and not actuals.empty:
-        merged = period_predictions.merge(actuals, left_on='ds', right_on='date', how='inner')
-        print(f"[v{VERSION}] Product {product_id}: Merged rows={len(merged)}")
-        
-        if merged.empty:
-            print(f"[v{VERSION}] No matching data for {model_name} for product {product_id}")
-            return get_default_result(product_id, period)
-        
-        if 'quantity' not in merged.columns or 'yhat' not in merged.columns:
-            print(f"[v{VERSION}] Missing 'quantity' or 'yhat' in merged DataFrame for product {product_id}")
-            return get_default_result(product_id, period)
-        
-        metrics.update({
-            'RMSE': np.sqrt(mean_squared_error(merged['quantity'], merged['yhat'])),
-            'R2': r2_score(merged['quantity'], merged['yhat']) if len(merged) > 1 else 0.0,
-            'MAE': mean_absolute_error(merged['quantity'], merged['yhat']),
-            'SMAPE': smape(merged['quantity'], merged['yhat']),
-            'Avg_Quantity_Real': merged['quantity'].mean()
-        })
-    else:
-        print(f"[v{VERSION}] No actuals data for product {product_id} in {period} period")
-        return get_default_result(product_id, period)
-    
+    print(f"[v{VERSION}] Metrics for {product_id} ({model_name}): {metrics}")
     return metrics
-    
+
 def generate_html_report(timestamp, template_vars):
     template_name = 'template.html'
     possible_dirs = [
@@ -557,60 +598,89 @@ def generate_html_report(timestamp, template_vars):
         print(f"[v{VERSION}] Generated fallback HTML report: {html_path}")
 
 def main():
+    config = load_config()
     start_time = datetime.now()
     print(f"[v{VERSION}] Script started at {start_time}")
     timestamp = start_time.strftime("%Y%m%d_%H%M%S")
-    
     parser = argparse.ArgumentParser(description="Sales Forecasting Script")
-    parser.add_argument("--holdout-days", type=int, default=CONFIG['periods']['holdout_days'], help="Number of days for hold-out period")
-    parser.add_argument("--forecast-days", type=int, default=CONFIG['periods']['forecast_days'], help="Number of days for forecast period")
+    parser.add_argument("--holdout-days", type=int, default=config['periods']['holdout_days'], help="Number of days for hold-out period")
+    parser.add_argument("--forecast-days", type=int, default=config['periods']['forecast_days'], help="Number of days for forecast period")
     parser.add_argument("--force-retrain", action="store_true", help="Force full retrain")
     args = parser.parse_args()
-    
     df = load_data()
     products = df['product_id'].unique()
     print(f"[v{VERSION}] Loaded data: {len(df)} rows, products: {products}, zero quantity ratio: {df['quantity'].eq(0).mean():.2f}")
-    
     hold_out_end = df['date'].max()
     hold_out_start = hold_out_end - pd.Timedelta(days=args.holdout_days)
     forecast_start = hold_out_end + pd.Timedelta(days=1)
     forecast_end = forecast_start + pd.Timedelta(days=args.forecast_days)
-    
-    # Log holdout data availability
-    print(f"[v{VERSION}] Checking holdout data availability for {args.holdout_days} days ({hold_out_start} to {hold_out_end})")
+    results = []
+    daily_predictions = []
+    weekly_predictions = []
+    feature_insights = []
     sparse_products = []
-    for product in products:
-        product_df = df[df['product_id'] == product]
-        holdout_df = product_df[product_df['date'].between(hold_out_start, hold_out_end)]
-        print(f"[v{VERSION}] Product {product}: {len(holdout_df)} rows in holdout period")
-        if len(holdout_df) < args.holdout_days * 0.5:  # Flag if less than 50% coverage
-            print(f"[v{VERSION}] Warning: Product {product} has sparse holdout data ({len(holdout_df)}/{args.holdout_days} days)")
-            sparse_products.append(product)
-    
+    high_smape_products = []
+    print(f"[v{VERSION}] Checking holdout data availability for {args.holdout_days} days ({hold_out_start} to {hold_out_end})")
+    min_holdout_ratio = 0.3
     last_update_file = os.path.join(OUTPUT_DIR, "last_update.txt")
     last_retrain_file = os.path.join(OUTPUT_DIR, "last_retrain.txt")
     last_update = datetime.fromtimestamp(0)
     last_retrain = datetime.fromtimestamp(0)
-    
     if os.path.exists(last_update_file):
         with open(last_update_file, 'r') as f:
             last_update = datetime.strptime(f.read().strip(), "%Y-%m-%d %H:%M:%S")
     if os.path.exists(last_retrain_file):
         with open(last_retrain_file, 'r') as f:
             last_retrain = datetime.strptime(f.read().strip(), "%Y-%m-%d %H:%M:%S")
-    
     new_data = df[df['date'] > last_update]
     current_day = start_time.date()
     last_retrain_day = last_retrain.date()
     retrain_needed = args.force_retrain or (current_day - last_retrain_day).days >= 7
-    
-    results = []
-    daily_predictions = []
-    weekly_predictions = []
-    feature_insights = []
-    high_smape_products = []
-    
     for product in products:
+        product_df = df[df['product_id'] == product]
+        holdout_df = product_df[product_df['date'].between(hold_out_start, hold_out_end)]
+        print(f"[v{VERSION}] Product {product}: {len(holdout_df)} rows in holdout period")
+        if len(holdout_df) < args.holdout_days * min_holdout_ratio:
+            print(f"[v{VERSION}] Skipping product {product}: sparse holdout data ({len(holdout_df)}/{args.holdout_days} days)")
+            sparse_products.append(product)
+            product_df, _, _ = prepare_data(df, product, hold_out_start)
+            future_dates = pd.date_range(start=hold_out_start, end=forecast_end, freq='D')
+            fallback_forecast = pd.DataFrame({
+                'ds': future_dates,
+                'yhat': [product_df['quantity'].mean() if not product_df.empty else 0.0] * len(future_dates)
+            })
+            for model_name in ['Prophet', 'XGBoost', 'LightGBM', 'CatBoost', 'Ensemble']:
+                default_metrics = get_default_result(product, 'Holdout')
+                results.append(default_metrics)
+                results.append(get_default_result(product, 'Forecast'))
+                daily_predictions.extend(save_daily_predictions(
+                    product, model_name, fallback_forecast, product_df, hold_out_start, hold_out_end, forecast_start, forecast_end, sparse_products
+                ))
+            holdout_actuals = product_df[product_df['date'].between(hold_out_start, hold_out_end)][['date', 'quantity']]
+            holdout_actuals = holdout_actuals.drop_duplicates(subset=['date'], keep='first')
+            holdout_actuals['date'] = pd.to_datetime(holdout_actuals['date']).dt.normalize()
+            if holdout_actuals.empty:
+                print(f"[v{VERSION}] No holdout actuals for product {product}")
+                results.append(get_default_result(product, 'Holdout'))
+            else:
+                for _, row in holdout_actuals.iterrows():
+                    key = (product, row['date'].strftime('%Y-%m-%d'), 'Actual', 'Holdout')
+                    if key not in [(d['product'], d['date'], d['model'], d['period']) for d in daily_predictions]:
+                        daily_predictions.append({
+                            'product': product,
+                            'date': row['date'].strftime('%Y-%m-%d'),
+                            'model': 'Actual',
+                            'period': 'Holdout',
+                            'actual': float(row['quantity']),
+                            'predicted': None
+                        })
+            weekly_predictions.extend(save_weekly_predictions(
+                product, {model_name: fallback_forecast for model_name in ['Prophet', 'XGBoost', 'LightGBM', 'CatBoost', 'Ensemble']},
+                hold_out_start, hold_out_end, forecast_start, forecast_end
+            ))
+            feature_insights.append({'product': product, 'top_features': [{'Feature': 'N/A', 'Importance': 0.0}]})
+            continue
+        # Non-sparse product processing
         print(f"[v{VERSION}] Processing product: {product}")
         product_df, _, _ = prepare_data(df, product, hold_out_start)
         if product_df.empty:
@@ -623,10 +693,11 @@ def main():
                 'yhat': [mean_quantity] * len(future_dates)
             })
             for model_name in ['Prophet', 'XGBoost', 'LightGBM', 'CatBoost', 'Ensemble']:
-                results.append(get_default_result(product, 'Holdout'))
+                default_metrics = get_default_result(product, 'Holdout')
+                results.append(default_metrics)
                 results.append(get_default_result(product, 'Forecast'))
                 daily_predictions.extend(save_daily_predictions(
-                    product, model_name, fallback_forecast, product_df, hold_out_start, hold_out_end, forecast_start, forecast_end
+                    product, model_name, fallback_forecast, product_df, hold_out_start, hold_out_end, forecast_start, forecast_end, sparse_products
                 ))
             weekly_predictions.extend(save_weekly_predictions(
                 product, {model_name: fallback_forecast for model_name in ['Prophet', 'XGBoost', 'LightGBM', 'CatBoost', 'Ensemble']},
@@ -634,7 +705,6 @@ def main():
             ))
             feature_insights.append({'product': product, 'top_features': [{'Feature': 'N/A', 'Importance': 0.0}]})
             continue
-        
         model_files = {
             'Prophet': f'prophet_model_{product}.pkl',
             'XGBoost': f'xgb_model_{product}.pkl',
@@ -671,7 +741,7 @@ def main():
                     if row['ds'] >= forecast_start:
                         idx = i - len(pd.date_range(hold_out_start, hold_out_end))
                         if idx < len(future_regressors):
-                            for col in ['campaign_intensity', 'holiday', 'season']:
+                            for col in ['campaign_intensity', 'holiday', 'season', 'zero_sale_indicator']:
                                 future_df.loc[i, col] = future_regressors[col].iloc[idx]
                 future_df.fillna(0, inplace=True)
                 if name == 'Prophet':
@@ -684,22 +754,41 @@ def main():
                     forecast = pd.DataFrame({'ds': future_dates, 'yhat': pred})
                 predictions[name] = forecast
             models[name] = model
-        
-        # Evaluate models only once per period
+        df_actuals = product_df[product_df['date'].between(hold_out_start, hold_out_end)][['product_id', 'date', 'quantity']].rename(columns={'date': 'ds', 'quantity': 'y'})
+        print(f"[v{VERSION}] df_actuals for {product}: columns={df_actuals.columns}, rows={len(df_actuals)}, head={df_actuals.head()}")
         model_weights = {}
         for name, pred in predictions.items():
-            if len(pred) != len(pd.date_range(start=hold_out_start, end=forecast_end, freq='D')):
-                print(f"[v{VERSION}] Warning: Predictions for {name} ({product}) have {len(pred)} rows, expected {len(pd.date_range(start=hold_out_start, end=forecast_end, freq='D'))}")
+            expected_rows = len(pd.date_range(start=hold_out_start, end=forecast_end, freq='D'))
+            if len(pred) != expected_rows:
+                print(f"[v{VERSION}] Warning: Predictions for {name} ({product}) have {len(pred)} rows, expected {expected_rows}")
                 pred = pred[pred['ds'].between(hold_out_start, forecast_end)]
-            metrics = evaluate_model(product_df, pred, hold_out_start, hold_out_end, name, hold_out_start)
+            print(f"[v{VERSION}] df_actuals ds dtype: {df_actuals['ds'].dtype}, predictions ds dtype: {pred['ds'].dtype}")
+            metrics = evaluate_model(pred, df_actuals, product, name, hold_out_start, hold_out_end, forecast_start, forecast_end)
+            if metrics is None:
+                print(f"[v{VERSION}] Skipping evaluation for {product}: No holdout actuals")
+                continue
             smape = metrics['SMAPE'] if pd.notnull(metrics['SMAPE']) else 100.0
             if smape > 100:
                 high_smape_products.append(product)
             model_weights[name] = 1.0 / max(smape, 1e-10)
-            results.append(metrics)
-            results.append(evaluate_model(product_df, pred, forecast_start, forecast_end, name, hold_out_start))
-        
-        # Ensemble predictions
+            results.append({
+                'Product': product,
+                'Model': name,
+                'Period': 'Holdout',
+                'Avg_Quantity_Pred': pred['yhat'][pred['ds'].between(hold_out_start, hold_out_end)].mean(),
+                'Avg_Quantity_Real': df_actuals['y'].mean() if not df_actuals.empty else 0.0,
+                'RMSE': metrics['RMSE'],
+                'R2': metrics['R2'],
+                'MAE': metrics['MAE'],
+                'SMAPE': metrics['SMAPE']
+            })
+            results.append({
+                'Product': product,
+                'Model': name,
+                'Period': 'Forecast',
+                'Avg_Quantity_Pred': pred['yhat'][pred['ds'] >= forecast_start].mean(),
+                'Avg_Quantity_Real': None
+            })
         total_weight = sum(model_weights.values())
         model_weights = {k: v / total_weight if total_weight > 0 else 0.25 for k, v in model_weights.items()}
         ensemble_predictions = pd.DataFrame({
@@ -707,59 +796,48 @@ def main():
             'yhat': sum(model_weights[name] * predictions[name]['yhat'] for name in predictions)
         })
         ensemble_predictions['yhat'] = np.maximum(ensemble_predictions['yhat'], 0)
-        results.append(evaluate_model(product_df, ensemble_predictions, hold_out_start, hold_out_end, 'Ensemble', hold_out_start))
-        results.append(evaluate_model(product_df, ensemble_predictions, forecast_start, forecast_end, 'Ensemble', hold_out_start))
-        
-        # Save predictions
+        ensemble_metrics = evaluate_model(ensemble_predictions, df_actuals, product, 'Ensemble', hold_out_start, hold_out_end, forecast_start, forecast_end)
+        if ensemble_metrics is not None:
+            smape = ensemble_metrics['SMAPE'] if pd.notnull(ensemble_metrics['SMAPE']) else 100.0
+            if smape > 100:
+                high_smape_products.append(product)
+            results.append({
+                'Product': product,
+                'Model': 'Ensemble',
+                'Period': 'Holdout',
+                'Avg_Quantity_Pred': ensemble_predictions['yhat'][ensemble_predictions['ds'].between(hold_out_start, hold_out_end)].mean(),
+                'Avg_Quantity_Real': df_actuals['y'].mean() if not df_actuals.empty else 0.0,
+                'RMSE': ensemble_metrics['RMSE'],
+                'R2': ensemble_metrics['R2'],
+                'MAE': ensemble_metrics['MAE'],
+                'SMAPE': ensemble_metrics['SMAPE']
+            })
+        results.append({
+            'Product': product,
+            'Model': 'Ensemble',
+            'Period': 'Forecast',
+            'Avg_Quantity_Pred': ensemble_predictions['yhat'][ensemble_predictions['ds'] >= forecast_start].mean(),
+            'Avg_Quantity_Real': None
+        })
         for model_name, pred in {**predictions, 'Ensemble': ensemble_predictions}.items():
             daily_predictions.extend(save_daily_predictions(
-                product, model_name, pred, product_df, hold_out_start, hold_out_end, forecast_start, forecast_end
+                product, model_name, pred, product_df, hold_out_start, hold_out_end, forecast_start, forecast_end, sparse_products
             ))
-        
         weekly_predictions.extend(save_weekly_predictions(
             product, {**predictions, 'Ensemble': ensemble_predictions},
             hold_out_start, hold_out_end, forecast_start, forecast_end
         ))
-        
         feature_insights.append(compute_feature_importance(models, FEATURES, product, timestamp))
-    
-    # Save actuals for holdout period
-    actual_predictions = []
-    for product in products:
-        product_df, _, _ = prepare_data(df, product, hold_out_start)
-        holdout_actuals = product_df[product_df['date'].between(hold_out_start, hold_out_end)][['date', 'quantity']]
-        holdout_actuals = holdout_actuals.drop_duplicates(subset=['date'], keep='first')
-        holdout_actuals['date'] = pd.to_datetime(holdout_actuals['date']).dt.normalize()
-        if holdout_actuals.empty:
-            print(f"[v{VERSION}] No holdout actuals for product {product}")
-            results.append(get_default_result(product, 'Holdout'))
-        for _, row in holdout_actuals.iterrows():
-            key = (product, row['date'].strftime('%Y-%m-%d'), 'Actual', 'Holdout')
-            if key not in [(d['product'], d['date'], d['model'], d['period']) for d in daily_predictions]:
-                actual_predictions.append({
-                    'product': product,
-                    'date': row['date'].strftime('%Y-%m-%d'),
-                    'model': 'Actual',
-                    'period': 'Holdout',
-                    'actual': float(row['quantity']),
-                    'predicted': None
-                })
-    daily_predictions.extend(actual_predictions)
-    
-    # Save outputs
     results_df = pd.DataFrame(results)
     results_df.to_csv(os.path.join(OUTPUT_DIR, f'model_comparison_{timestamp}.csv'), index=False)
     daily_df = pd.DataFrame(daily_predictions)
     daily_df.to_csv(os.path.join(OUTPUT_DIR, f'daily_predictions_{timestamp}.csv'), index=False)
     weekly_df = pd.DataFrame(weekly_predictions)
     weekly_df.to_csv(os.path.join(OUTPUT_DIR, f'weekly_predictions_{timestamp}.csv'), index=False)
-    
     csv_data = clean_data_for_json(results_df.to_dict('records'))
     csv_data_json = json.dumps(csv_data, ensure_ascii=False, allow_nan=True)
-    
     chart_data = clean_data_for_json(daily_predictions)
     chart_data_json = json.dumps(chart_data, ensure_ascii=False, allow_nan=True)
-    
     validated_feature_insights = []
     for product in products:
         product_features = next((item for item in feature_insights if item.get('product') == product), None)
@@ -768,17 +846,15 @@ def main():
         else:
             validated_feature_insights.append({'product': product, 'top_features': [{'Feature': 'N/A', 'Importance': 0.0}]})
     feature_insights_json = json.dumps(clean_data_for_json(validated_feature_insights), ensure_ascii=False, allow_nan=True)
-    
     holdout_table = format_df(results_df[results_df['Period'] == 'Holdout'], 'holdout')
-    forecast_table = format_df(results_df[results_df['Period'] == 'Forecast'][['Product', 'Model', 'Avg_Quantity_Pred']], 'forecast')
-    
+    forecast_table = format_df(results_df[results_df['Period'] == 'Forecast'][['Product', 'Model', 'Period', 'Avg_Quantity_Pred']], 'forecast')
     template_vars = {
         'report_date': start_time.strftime('%B %d, %Y'),
         'version': VERSION,
         'alerts': generate_alerts(high_smape_products, sparse_products),
         'summary': generate_summary_txt(timestamp, hold_out_start, hold_out_end, forecast_start, forecast_end),
         'interesting_fact': generate_interesting_fact(daily_predictions, products, hold_out_start, hold_out_end),
-        'business_strategies': generate_business_strategies(results, products),
+        'business_strategies': generate_business_strategies(results, products, sparse_products),
         'hold_out_start': hold_out_start.strftime('%Y-%m-%d'),
         'hold_out_end': hold_out_end.strftime('%Y-%m-%d'),
         'forecast_start': forecast_start.strftime('%Y-%m-%d'),
@@ -787,20 +863,18 @@ def main():
         'forecast_table': forecast_table,
         'csv_data_json': csv_data_json,
         'chart_data_json': chart_data_json,
-        'feature_insights_json': feature_insights_json
+        'feature_insights_json': feature_insights_json,
+        'all_products': list(products)
     }
-    
     generate_html_report(timestamp, template_vars)
-    
     if not new_data.empty:
         with open(last_update_file, 'w') as f:
             f.write(start_time.strftime("%Y-%m-%d %H:%M:%S"))
     if retrain_needed:
         with open(last_retrain_file, 'w') as f:
             f.write(start_time.strftime("%Y-%m-%d %H:%M:%S"))
-    
     return results, template_vars['business_strategies']
-
+    
 if __name__ == "__main__":
     try:
         main()
